@@ -21,25 +21,26 @@ aws_session_token=$(echo "$credentials_json" | jq -r '.Credentials.SessionToken'
 export AWS_ACCESS_KEY_ID=$aws_access_key
 export AWS_SECRET_ACCESS_KEY=$aws_secret_access_key
 export AWS_SESSION_TOKEN=$aws_session_token 
+
 get_caller_identity=$(aws sts get-caller-identity)
-# Prompt for input
+echo get_caller_identity
+
+# Cross-platform date increment
+if date -d "20200101 +1 day" +"%Y%m%d" >/dev/null 2>&1; then
+    increment_date() { date -d "$1 +1 day" +"%Y%m%d"; }
+else
+    increment_date() { date -j -f "%Y%m%d" "$1" -v+1d +"%Y%m%d"; }
+fi
+
 read -p "Enter customer name: " customer
 read -p "Enter start date (YYYYMMDD): " start_date
 read -p "Enter end date (YYYYMMDD, leave blank for single day): " end_date
 read -p "Enter S3 bucket name: " bucket
 
-# Function to increment date (macOS/BSD date)
-increment_date() {
-    date -j -f "%Y%m%d" "$1" -v+1d +"%Y%m%d"
-}
-
-# Determine date and hour range
 if [ -z "$end_date" ]; then
     end_date="$start_date"
     read -p "Enter start hour (00-23): " start_hour
     read -p "Enter end hour (00-23): " end_hour
-
-    # Ensure zero-padding
     start_hour=$(printf "%02d" "$start_hour")
     end_hour=$(printf "%02d" "$end_hour")
 else
@@ -50,7 +51,6 @@ fi
 current_date="$start_date"
 
 while [[ "$current_date" -le "$end_date" ]]; do
-    # For a single day, use the user-specified hour range; for multiple days, use all hours
     if [[ "$start_date" == "$end_date" ]]; then
         hour_start="$start_hour"
         hour_end="$end_hour"
@@ -67,9 +67,13 @@ while [[ "$current_date" -le "$end_date" ]]; do
         aws s3 cp "s3://${bucket}/${s3_prefix}" "$local_dir" --recursive
     done
 
-    if [ "$current_date" == "$end_date" ]; then
+    if [[ "$current_date" == "$end_date" ]]; then
         break
     fi
     current_date=$(increment_date "$current_date")
+    # Debug:
+    # echo "DEBUG: current_date after increment = $current_date"
 done
+
+echo "✅ All logs downloaded to ./customer_logs/${customer}/"
 
