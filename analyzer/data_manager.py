@@ -5,6 +5,7 @@ import logging
 from io import BytesIO
 import openpyxl
 import glob
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -28,10 +29,10 @@ class DataManager:
             for file in csv_files:
                 os.remove(file)
                 logger.info(f"Deleted data file: {file}")
-            state_file = os.path.join(self.state_dir, 'analysis_state.json')
-            if os.path.exists(state_file):
-                os.remove(state_file)
-                logger.info(f"Deleted state file: {state_file}")
+            state_files = glob.glob(os.path.join(self.state_dir, '*.json'))
+            for file in state_files:
+                os.remove(file)
+                logger.info(f"Deleted state file: {file}")
         except Exception as e:
             logger.error(f"Error clearing data: {str(e)}")
             raise
@@ -176,27 +177,38 @@ class DataManager:
             logger.error(f"Error getting class/service counts: {str(e)}")
             raise
 
-    def save_state(self, state):
-        """Save analysis state."""
+    def save_state(self, state, log_folder):
+        """Save analysis state with folder_path_datetime naming."""
         try:
-            with open(os.path.join(self.state_dir, 'analysis_state.json'), 'w') as f:
+            # Create filename: replace '/' with '_' in folder path and append datetime
+            folder_part = log_folder.replace('/', '_').replace('\\', '_')
+            dt_part = datetime.now().strftime('%Y%m%d%H%M%S')
+            state_filename = f"{folder_part}_{dt_part}.json"
+            state_path = os.path.join(self.state_dir, state_filename)
+            with open(state_path, 'w') as f:
                 json.dump(state, f)
-            logger.info("Saved state")
+            logger.info(f"Saved state to {state_path}")
+            # Clean up old states (keep only latest 10)
+            state_files = sorted(glob.glob(os.path.join(self.state_dir, '*.json')), key=os.path.getmtime, reverse=True)
+            for old_file in state_files[10:]:
+                os.remove(old_file)
+                logger.info(f"Deleted old state file: {old_file}")
         except Exception as e:
             logger.error(f"Error saving state: {str(e)}")
             raise
 
-    def load_state(self):
-        """Load analysis state."""
+    def load_state(self, state_file):
+        """Load analysis state from a specific file."""
         try:
-            state_file = os.path.join(self.state_dir, 'analysis_state.json')
             if os.path.exists(state_file):
                 with open(state_file, 'r') as f:
-                    return json.load(f)
-            logger.debug("No previous state found")
+                    state = json.load(f)
+                    logger.info(f"Loaded state from {state_file}")
+                    return state
+            logger.debug(f"State file {state_file} not found")
             return None
         except Exception as e:
-            logger.error(f"Error loading state: {str(e)}")
+            logger.error(f"Error loading state from {state_file}: {str(e)}")
             raise
 
     def create_excel(self):

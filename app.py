@@ -9,6 +9,7 @@ import pandas as pd
 from datetime import datetime
 import time
 import sys
+import glob
 
 # Increase recursion limit
 sys.setrecursionlimit(3000)
@@ -30,6 +31,26 @@ def update_log_folder():
     new_value = st.session_state.log_folder_input
     logger.debug(f"update_log_folder called, new_value: {new_value}")
     st.session_state.log_folder = new_value
+
+def get_available_states():
+    """Get list of saved state files sorted by datetime (newest first)."""
+    state_dir = config['paths']['state_dir']
+    state_files = glob.glob(os.path.join(state_dir, '*.json'))
+    state_info = []
+    for file in state_files:
+        try:
+            file_name = os.path.basename(file)
+            # Extract datetime from filename (format: folder_path_datetime.json)
+            parts = file_name.rsplit('_', 1)
+            if len(parts) == 2:
+                folder_path = parts[0].replace('_', '/')
+                dt = datetime.strptime(parts[1].replace('.json', ''), '%Y%m%d%H%M%S')
+                state_info.append((file, folder_path, dt))
+        except Exception as e:
+            logger.warning(f"Invalid state file name {file}: {str(e)}")
+    # Sort by datetime descending
+    state_info.sort(key=lambda x: x[2], reverse=True)
+    return state_info
 
 def render_full_ui():
     """Render the entire UI within a single container."""
@@ -76,6 +97,17 @@ def render_full_ui():
         # Footer
         days_processed = len(set(folder.split('-')[0] for folder in st.session_state.folders_processed)) if st.session_state.folders_processed else 0
         hours_processed = len(st.session_state.folders_processed) if st.session_state.folders_processed else 0
+        # Calculate estimated time to complete
+        eta_text = "N/A"
+        if st.session_state.files_processed > 0 and st.session_state.average_file_time:
+            remaining_files = st.session_state.files_remaining
+            eta_seconds = remaining_files * st.session_state.average_file_time
+            if eta_seconds < 60:
+                eta_text = f"{int(eta_seconds)} seconds"
+            elif eta_seconds < 3600:
+                eta_text = f"{int(eta_seconds // 60)} minutes"
+            else:
+                eta_text = f"{int(eta_seconds // 3600)} hours {int((eta_seconds % 3600) // 60)} minutes"
         st.markdown(f"""
             <div class="footer">
                 <div class="counter">
@@ -105,6 +137,10 @@ def render_full_ui():
                 <div class="counter">
                     <span>{st.session_state.current_file or 'None'}</span>
                     <p>Current File</p>
+                </div>
+                <div class="counter">
+                    <span>{eta_text}</span>
+                    <p>Est. Time to Complete</p>
                 </div>
             </div>
         """, unsafe_allow_html=True)
@@ -224,6 +260,18 @@ def main():
             border-radius: 8px; 
             padding: 8px; 
         }
+        .stSelectbox>label { 
+            color: #1A1A1A; 
+            font-size: 1em; 
+            font-weight: 500; 
+        }
+        .stSelectbox>div>select { 
+            background: #f0ede6; 
+            color: #1A1A1A; 
+            border: 1px solid #D1D5DB; 
+            border-radius: 8px; 
+            padding: 8px; 
+        }
 
         /* Main content */
         .main-content { 
@@ -289,15 +337,17 @@ def main():
             text-align: center; 
             color: #12133f; 
         }
-        .counter span, .counter p { 
-            font-size: 1.2em; 
+        .counter span { 
+            font-size: 1em; 
             color: #12133f; 
-            font-weight: 500; 
+            font-weight: bold; 
             transition: all 0.5s ease-in-out; 
             margin: 5px 0;
         }
         .counter p { 
-            font-size: 0.8em; 
+            font-size: 0.7em; 
+            color: #12133f; 
+            margin: 5px 0;
         }
 
         /* Progress bar */
@@ -378,6 +428,7 @@ def main():
         st.session_state.log_page = 1
         st.session_state.selected_index = None
         st.session_state.selected_level = None
+        st.session_state.average_file_time = 0  # For ETA calculation
 
     # Main content
     main_placeholder = st.empty()
@@ -393,6 +444,16 @@ def main():
             on_change=update_log_folder
         )
         logger.debug(f"Log folder input after rendering: {log_folder}")
+        
+        # State selection dropdown
+        state_info = get_available_states()
+        state_options = [f"{folder_path} ({dt.strftime('%Y-%m-%d %H:%M:%S')})" for _, folder_path, dt in state_info]
+        state_options.insert(0, "Select a state (default: latest)")
+        selected_state = st.selectbox(
+            "Select Saved State",
+            options=state_options,
+            key="state_select"
+        )
         
         col1, col2 = st.columns(2)
         with col1:
@@ -457,6 +518,7 @@ def main():
                     st.session_state.files_remaining = st.session_state.total_files
                     st.session_state.folders_processed = set()
                     st.session_state.current_folder = None
+                    st.session_state.average_file_time = 0
                     st.session_state.dashboard_data = {
                         'level_counts_by_class': pd.DataFrame(),
                         'level_counts_by_service': pd.DataFrame(),
@@ -492,7 +554,7 @@ def main():
             try:
                 st.session_state.processor.save_state()
                 st.session_state.app_state = 'PAUSED'
-                st.session_state.notifications.append({'type': 'success', 'message': "Analysis paused", 'timestamp': time.time()})
+                st.session_state.notifications.append({'type': 'success', 'message': "Analysis paused and state saved", 'timestamp': time.time()})
                 logger.info("Analysis paused")
                 # Clear visualization state
                 st.session_state.logs_to_display_class = []
@@ -512,43 +574,59 @@ def main():
     if resume_btn:
         logger.debug(f"Resume Analysis clicked, current_state: {st.session_state.app_state}")
         try:
-            state = st.session_state.data_manager.load_state()
-            if not state or not os.path.exists(state.get('log_folder', '')):
-                st.session_state.notifications.append({'type': 'warning', 'message': "No valid checkpoint found. Please start a fresh analysis.", 'timestamp': time.time()})
-                logger.warning("No valid checkpoint found for resume")
+            state_info = get_available_states()
+            if not state_info:
+                st.session_state.notifications.append({'type': 'warning', 'message': "No saved states found. Please start a fresh analysis.", 'timestamp': time.time()})
+                logger.warning("No saved states found for resume")
             else:
-                logger.debug(f"Resuming with log_folder from state: {state['log_folder']}")
-                st.session_state.processor = LogProcessor(
-                    state['log_folder'], 
-                    config, 
-                    st.session_state.data_manager,
-                    state
-                )
-                st.session_state.last_update_time = time.time()
-                st.session_state.total_lines_processed = state.get('total_lines_processed', 0)
-                st.session_state.files_processed = state.get('files_processed', 0)
-                st.session_state.total_files = st.session_state.processor.get_total_files()
-                st.session_state.files_remaining = st.session_state.processor.get_remaining_files()
-                st.session_state.folders_processed = set(state.get('folders_processed', []))
-                st.session_state.dashboard_data = {
-                    'level_counts_by_class': st.session_state.data_manager.get_level_counts_by_class(),
-                    'level_counts_by_service': st.session_state.data_manager.get_level_counts_by_service(),
-                    'timeline_data': st.session_state.data_manager.get_timeline_data(),
-                    'class_service_counts': st.session_state.data_manager.get_class_service_counts()
-                }
-                st.session_state.app_state = 'RUNNING'
-                st.session_state.logs_to_display_class = []
-                st.session_state.logs_to_display_service = []
-                st.session_state.total_logs_class = 0
-                st.session_state.total_logs_service = 0
-                st.session_state.log_page = 1
-                st.session_state.selected_index = None
-                st.session_state.selected_level = None
-                st.session_state.pop('search_query_class', None)
-                st.session_state.pop('search_query_service', None)
-                logger.debug(f"Resumed analysis, total_files: {st.session_state.total_files}, files_remaining: {st.session_state.files_remaining}, log_folder: {state['log_folder']}")
-                st.session_state.notifications.append({'type': 'success', 'message': "Resumed analysis from checkpoint", 'timestamp': time.time()})
-                logger.info("Resumed analysis from checkpoint")
+                # Determine which state to load
+                selected_state_file = None
+                if selected_state != "Select a state (default: latest)":
+                    selected_idx = state_options.index(selected_state) - 1  # Adjust for default option
+                    selected_state_file = state_info[selected_idx][0]
+                else:
+                    # Default to latest state
+                    selected_state_file = state_info[0][0]
+                
+                state = st.session_state.data_manager.load_state(selected_state_file)
+                if not state or not os.path.exists(state.get('log_folder', '')):
+                    st.session_state.notifications.append({'type': 'warning', 'message': "Selected state is invalid or log folder does not exist.", 'timestamp': time.time()})
+                    logger.warning(f"Invalid state or missing log folder in state: {selected_state_file}")
+                else:
+                    logger.debug(f"Resuming with state: {selected_state_file}, log_folder: {state['log_folder']}")
+                    st.session_state.processor = LogProcessor(
+                        state['log_folder'], 
+                        config, 
+                        st.session_state.data_manager,
+                        state
+                    )
+                    st.session_state.log_folder = state['log_folder']
+                    st.session_state.last_update_time = time.time()
+                    st.session_state.total_lines_processed = state.get('total_lines_processed', 0)
+                    st.session_state.files_processed = state.get('files_processed', 0)
+                    st.session_state.total_files = st.session_state.processor.get_total_files()
+                    st.session_state.files_remaining = st.session_state.processor.get_remaining_files()
+                    st.session_state.folders_processed = set(state.get('folders_processed', []))
+                    st.session_state.average_file_time = state.get('average_file_time', 0)
+                    st.session_state.dashboard_data = {
+                        'level_counts_by_class': st.session_state.data_manager.get_level_counts_by_class(),
+                        'level_counts_by_service': st.session_state.data_manager.get_level_counts_by_service(),
+                        'timeline_data': st.session_state.data_manager.get_timeline_data(),
+                        'class_service_counts': st.session_state.data_manager.get_class_service_counts()
+                    }
+                    st.session_state.app_state = 'RUNNING'
+                    st.session_state.logs_to_display_class = []
+                    st.session_state.logs_to_display_service = []
+                    st.session_state.total_logs_class = 0
+                    st.session_state.total_logs_service = 0
+                    st.session_state.log_page = 1
+                    st.session_state.selected_index = None
+                    st.session_state.selected_level = None
+                    st.session_state.pop('search_query_class', None)
+                    st.session_state.pop('search_query_service', None)
+                    logger.debug(f"Resumed analysis, total_files: {st.session_state.total_files}, files_remaining: {st.session_state.files_remaining}, log_folder: {state['log_folder']}")
+                    st.session_state.notifications.append({'type': 'success', 'message': f"Resumed analysis from state: {os.path.basename(selected_state_file)}", 'timestamp': time.time()})
+                    logger.info(f"Resumed analysis from state: {selected_state_file}")
         except Exception as e:
             st.session_state.notifications.append({'type': 'error', 'message': f"Error resuming analysis: {str(e)}", 'timestamp': time.time()})
             logger.error(f"Error resuming analysis: {str(e)}")
@@ -593,7 +671,11 @@ def main():
                     if st.session_state.current_folder:
                         st.session_state.folders_processed.add(st.session_state.current_folder)
                     files_processed_in_batch += 1
-                    logger.debug(f"Processed file: {st.session_state.current_file}, lines: {st.session_state.total_lines_processed}")
+                    # Update average file processing time
+                    if st.session_state.processor.last_file_time:
+                        total_time = st.session_state.average_file_time * (st.session_state.files_processed - 1) + st.session_state.processor.last_file_time
+                        st.session_state.average_file_time = total_time / st.session_state.files_processed
+                    logger.debug(f"Processed file: {st.session_state.current_file}, lines: {st.session_state.total_lines_processed}, avg_file_time: {st.session_state.average_file_time:.2f}s")
                 
                 # Update UI if batch complete or 30 seconds elapsed
                 if files_processed_in_batch >= batch_size or time.time() - st.session_state.last_update_time >= st.session_state.update_interval or not processed:
