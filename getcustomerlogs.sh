@@ -22,17 +22,15 @@ export AWS_ACCESS_KEY_ID=$aws_access_key
 export AWS_SECRET_ACCESS_KEY=$aws_secret_access_key
 export AWS_SESSION_TOKEN=$aws_session_token 
 get_caller_identity=$(aws sts get-caller-identity)
-echo $get_caller_identity
-
 # Prompt for input
 read -p "Enter customer name: " customer
 read -p "Enter start date (YYYYMMDD): " start_date
 read -p "Enter end date (YYYYMMDD, leave blank for single day): " end_date
 read -p "Enter S3 bucket name: " bucket
 
-# Function to increment date (Linux/GNU date)
+# Function to increment date (macOS/BSD date)
 increment_date() {
-    date -d "$1 + 1 day" +"%Y%m%d"
+    date -j -f "%Y%m%d" "$1" -v+1d +"%Y%m%d"
 }
 
 # Determine date and hour range
@@ -41,26 +39,34 @@ if [ -z "$end_date" ]; then
     read -p "Enter start hour (00-23): " start_hour
     read -p "Enter end hour (00-23): " end_hour
 
-    # Remove leading zeros for arithmetic, then use zero-padded values in loop
-    start_hour=$((10#$start_hour))
-    end_hour=$((10#$end_hour))
+    # Ensure zero-padding
+    start_hour=$(printf "%02d" "$start_hour")
+    end_hour=$(printf "%02d" "$end_hour")
 else
-    start_hour=0
-    end_hour=23
+    start_hour="00"
+    end_hour="23"
 fi
 
 current_date="$start_date"
 
 while [[ "$current_date" -le "$end_date" ]]; do
-    for hour in $(seq $start_hour $end_hour); do
-        # Always zero-pad hour when constructing paths
-        hour_padded=$(printf "%02d" "$hour")
-        s3_prefix="${customer}/${current_date}-${hour_padded}/"
-        local_dir="${customer}/${current_date}-${hour_padded}/"
+    # For a single day, use the user-specified hour range; for multiple days, use all hours
+    if [[ "$start_date" == "$end_date" ]]; then
+        hour_start="$start_hour"
+        hour_end="$end_hour"
+    else
+        hour_start="00"
+        hour_end="23"
+    fi
+
+    for hour in $(seq -w $hour_start $hour_end); do
+        s3_prefix="${customer}/${current_date}-${hour}/"
+        local_dir="./customer_logs/${customer}/${current_date}/${current_date}-${hour}/"
         echo "Fetching logs from: s3://${bucket}/${s3_prefix} to ${local_dir}"
         mkdir -p "$local_dir"
         aws s3 cp "s3://${bucket}/${s3_prefix}" "$local_dir" --recursive
     done
+
     if [ "$current_date" == "$end_date" ]; then
         break
     fi
