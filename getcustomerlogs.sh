@@ -25,18 +25,19 @@ export AWS_SESSION_TOKEN=$aws_session_token
 get_caller_identity=$(aws sts get-caller-identity)
 echo get_caller_identity
 
-# Cross-platform date increment
-if date -d "20200101 +1 day" +"%Y%m%d" >/dev/null 2>&1; then
-    increment_date() { date -d "$1 +1 day" +"%Y%m%d"; }
-else
-    increment_date() { date -j -f "%Y%m%d" "$1" -v+1d +"%Y%m%d"; }
-fi
 
+# Date increment function using Python (cross-platform and reliable)
+increment_date() {
+    python3 -c "from datetime import datetime, timedelta; print((datetime.strptime('$1', '%Y%m%d') + timedelta(days=1)).strftime('%Y%m%d'))"
+}
+
+# Prompt for input
 read -p "Enter customer name: " customer
 read -p "Enter start date (YYYYMMDD): " start_date
 read -p "Enter end date (YYYYMMDD, leave blank for single day): " end_date
 read -p "Enter S3 bucket name: " bucket
 
+# Handle hour range
 if [ -z "$end_date" ]; then
     end_date="$start_date"
     read -p "Enter start hour (00-23): " start_hour
@@ -51,6 +52,7 @@ fi
 current_date="$start_date"
 
 while [[ "$current_date" -le "$end_date" ]]; do
+    # For a single day, use user-specified hour range; for multiple days, use all hours
     if [[ "$start_date" == "$end_date" ]]; then
         hour_start="$start_hour"
         hour_end="$end_hour"
@@ -71,8 +73,6 @@ while [[ "$current_date" -le "$end_date" ]]; do
         break
     fi
     current_date=$(increment_date "$current_date")
-    # Debug:
-    # echo "DEBUG: current_date after increment = $current_date"
 done
 
 echo "✅ All logs downloaded to ./customer_logs/${customer}/"
