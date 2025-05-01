@@ -445,6 +445,7 @@ class Visualizer:
                     logger.error(f"Error rendering log form for {table_type}: {str(e)}\n{traceback.format_exc()}")
                     st.error(f"Error processing log form: {str(e)}")
 
+
     def _load_logs(self, index_col, level, table_type, log_processor, page=1, search_query=None, use_regex=False):
         """Load logs for the selected class/service and level for the specified page."""
         try:
@@ -647,20 +648,6 @@ class Visualizer:
             with st.container():
                 st.header("CSV Data Visualization Dashboard")
 
-                # Summary of loaded analyses
-                loaded_analyses = list(csv_data.keys())
-                st.subheader("Loaded Analyses")
-                if loaded_analyses:
-                    st.write(f"Loaded {len(loaded_analyses)} analyses: {', '.join(loaded_analyses)}")
-                    missing_analyses = [a for a in self.expected_analyses if a not in loaded_analyses]
-                    if missing_analyses:
-                        st.warning(f"Missing analyses: {', '.join(missing_analyses)}. Upload corresponding CSV files (e.g., {missing_analyses[0]}_YYYYMMDD_HHMMSS.csv).")
-                    logger.debug(f"Loaded analyses: {loaded_analyses}, missing: {missing_analyses}")
-                else:
-                    st.warning("No analyses loaded. Upload CSV files with names like time_range_YYYYMMDD_HHMMSS.csv.")
-                    logger.warning("No analyses loaded for CSV dashboard")
-                    return
-
                 # Time Range
                 if 'time_range' in csv_data and not csv_data['time_range'].empty:
                     st.subheader("Time Range Analysis")
@@ -705,6 +692,66 @@ class Visualizer:
                 else:
                     st.warning("Log level distribution not available. Upload level_summary_YYYYMMDD_HHMMSS.csv.")
                     logger.debug("No level_summary data available")
+
+                # Class-Level Pie Charts
+                if 'class_level_counts' in csv_data and not csv_data['class_level_counts'].empty:
+                    st.subheader("Log Levels by Class")
+                    try:
+                        class_level = csv_data['class_level_counts']
+                        required_columns = ['class']
+                        available_levels = [col for col in class_level.columns if col in self.valid_log_levels]
+                        if 'class' not in class_level.columns:
+                            st.warning("Class level counts CSV missing required column: class.")
+                            logger.error("Class level counts CSV missing column: class")
+                        elif not available_levels:
+                            st.warning(f"Class level counts CSV has no recognized log level columns (expected: {', '.join(self.valid_log_levels)}).")
+                            logger.error("Class level counts CSV has no recognized log level columns")
+                        else:
+                            logger.debug(f"Found log levels for class_level_counts: {available_levels}")
+                            st.info(f"Using available log levels: {', '.join(available_levels)}.")
+                            # Create summary DataFrame
+                            summary_df = class_level[['class'] + available_levels].copy()
+                            summary_df['Total'] = summary_df[available_levels].sum(axis=1)
+                            for level in available_levels:
+                                with st.expander(f"{level} Logs by Class", expanded=False):
+                                    level_data = class_level[['class', level]].copy()
+                                    level_data = level_data[level_data[level] > 0].rename(columns={level: 'Count'})
+                                    if not level_data.empty:
+                                        fig = self._create_pie_figure(
+                                            level_data,
+                                            'class',
+                                            'Count',
+                                            f"{level} Log Distribution by Class"
+                                        )
+                                        st.plotly_chart(fig, use_container_width=True)
+                                        st.dataframe(level_data, use_container_width=True)
+                                        logger.debug(f"Displayed {level} pie chart for class_level_counts")
+                                    else:
+                                        st.info(f"No {level} logs found for any class.")
+                                        logger.debug(f"No data for {level} in class_level_counts")
+                            st.subheader("Class Level Counts Summary")
+                            st.dataframe(summary_df, use_container_width=True)
+                            logger.debug("Displayed class level counts summary DataFrame")
+                    except Exception as e:
+                        st.warning("Error displaying log levels by class. Ensure class_level_counts.csv has valid data.")
+                        logger.error(f"Error displaying class_level_counts: {str(e)}")
+                else:
+                    st.warning("Log levels by class not available. Upload class_level_counts_YYYYMMDD_HHMMSS.csv.")
+                    logger.debug("No class_level_counts data available")
+
+                # Summary of loaded analyses
+                loaded_analyses = list(csv_data.keys())
+                st.subheader("Loaded Analyses")
+                if loaded_analyses:
+                    st.write(f"Loaded {len(loaded_analyses)} analyses: {', '.join(loaded_analyses)}")
+                    missing_analyses = [a for a in self.expected_analyses if a not in loaded_analyses]
+                    if missing_analyses:
+                        st.warning(f"Missing analyses: {', '.join(missing_analyses)}. Upload corresponding CSV files (e.g., {missing_analyses[0]}_YYYYMMDD_HHMMSS.csv).")
+                    logger.debug(f"Loaded analyses: {loaded_analyses}, missing: {missing_analyses}")
+                else:
+                    st.warning("No analyses loaded. Upload CSV files with names like time_range_YYYYMMDD_HHMMSS.csv.")
+                    logger.warning("No analyses loaded for CSV dashboard")
+                    return
 
                 # Class Summary
                 if 'class_summary' in csv_data and not csv_data['class_summary'].empty:
@@ -841,52 +888,6 @@ class Visualizer:
                     st.warning("Hourly log counts not available. Upload hourly_level_counts_YYYYMMDD_HHMMSS.csv.")
                     logger.debug("No hourly_level_counts data available")
 
-                # Class-Level Pie Charts
-                if 'class_level_counts' in csv_data and not csv_data['class_level_counts'].empty:
-                    st.subheader("Log Levels by Class")
-                    try:
-                        class_level = csv_data['class_level_counts']
-                        required_columns = ['class']
-                        available_levels = [col for col in class_level.columns if col in self.valid_log_levels]
-                        if 'class' not in class_level.columns:
-                            st.warning("Class level counts CSV missing required column: class.")
-                            logger.error("Class level counts CSV missing column: class")
-                        elif not available_levels:
-                            st.warning(f"Class level counts CSV has no recognized log level columns (expected: {', '.join(self.valid_log_levels)}).")
-                            logger.error("Class level counts CSV has no recognized log level columns")
-                        else:
-                            logger.debug(f"Found log levels for class_level_counts: {available_levels}")
-                            st.info(f"Using available log levels: {', '.join(available_levels)}.")
-                            # Create summary DataFrame
-                            summary_df = class_level[['class'] + available_levels].copy()
-                            summary_df['Total'] = summary_df[available_levels].sum(axis=1)
-                            for level in available_levels:
-                                with st.expander(f"{level} Logs by Class", expanded=False):
-                                    level_data = class_level[['class', level]].copy()
-                                    level_data = level_data[level_data[level] > 0].rename(columns={level: 'Count'})
-                                    if not level_data.empty:
-                                        fig = self._create_pie_figure(
-                                            level_data,
-                                            'class',
-                                            'Count',
-                                            f"{level} Log Distribution by Class"
-                                        )
-                                        st.plotly_chart(fig, use_container_width=True)
-                                        st.dataframe(level_data, use_container_width=True)
-                                        logger.debug(f"Displayed {level} pie chart for class_level_counts")
-                                    else:
-                                        st.info(f"No {level} logs found for any class.")
-                                        logger.debug(f"No data for {level} in class_level_counts")
-                            st.subheader("Class Level Counts Summary")
-                            st.dataframe(summary_df, use_container_width=True)
-                            logger.debug("Displayed class level counts summary DataFrame")
-                    except Exception as e:
-                        st.warning("Error displaying log levels by class. Ensure class_level_counts.csv has valid data.")
-                        logger.error(f"Error displaying class_level_counts: {str(e)}")
-                else:
-                    st.warning("Log levels by class not available. Upload class_level_counts_YYYYMMDD_HHMMSS.csv.")
-                    logger.debug("No class_level_counts data available")
-
                 # Class-Pod-Level Pie Charts
                 if 'class_level_pod' in csv_data and not csv_data['class_level_pod'].empty:
                     st.subheader("Log Levels by Class and Pod")
@@ -940,20 +941,22 @@ class Visualizer:
                     st.subheader("Error Analysis")
                     try:
                         error_analysis = csv_data['error_analysis']
-                        required_columns = ['class', 'pod', 'count']
+                        required_columns = ['class', 'count']
                         if not all(col in error_analysis.columns for col in required_columns):
-                            st.warning("Error analysis CSV missing required columns: class, pod, count.")
-                            logger.error("Error analysis CSV missing required columns")
+                            missing_cols = [col for col in required_columns if col not in error_analysis.columns]
+                            st.warning(f"Error analysis CSV missing required columns: {', '.join(missing_cols)}.")
+                            logger.error(f"Error analysis CSV missing required columns: {missing_cols}")
                         else:
-                            error_analysis['Class_Pod'] = error_analysis['class'] + ' / ' + error_analysis['pod']
+                            # Group by class and sum counts
+                            error_analysis = error_analysis.groupby('class')['count'].sum().reset_index()
                             fig = self._create_bar_figure(
                                 error_analysis.head(10),
-                                'Class_Pod',
+                                'class',
                                 'count',
-                                title="Top 10 Error Counts by Class and Pod"
+                                title="Top 10 Error Counts by Class"
                             )
                             st.plotly_chart(fig, use_container_width=True)
-                            st.dataframe(error_analysis[['class', 'pod', 'count']], use_container_width=True)
+                            st.dataframe(error_analysis[['class', 'count']], use_container_width=True)
                             logger.debug("Displayed error analysis")
                     except Exception as e:
                         st.warning("Error displaying error analysis. Ensure error_analysis.csv has valid data.")
