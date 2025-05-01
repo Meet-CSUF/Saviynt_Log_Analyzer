@@ -1,10 +1,12 @@
 import streamlit as st
 import plotly.express as px
+import plotly.graph_objects as go
 import pandas as pd
 import logging
 import json
 import time
 import traceback
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +21,20 @@ class Visualizer:
             'ERROR': '#E53E3E',
             'FATAL': '#805AD5'
         }
+        # Expected analysis names
+        self.expected_analyses = [
+            'class_level_counts',
+            'level_summary',
+            'class_summary',
+            'pod_summary',
+            'container_summary',
+            'host_summary',
+            'class_level_pod',
+            'hourly_level_counts',
+            'thread_summary',
+            'error_analysis',
+            'time_range'
+        ]
         # Initialize session state
         if 'logs_to_display_class' not in st.session_state:
             st.session_state.logs_to_display_class = []
@@ -61,18 +77,18 @@ class Visualizer:
         st.session_state.selected_service_level = st.session_state.service_level_select
 
     @st.cache_data
-    def _create_timeline_figure(_self, timeline_data):
+    def _create_timeline_figure(_self, data, x, y, color, title):
         """Create cached timeline figure."""
         fig = px.line(
-            timeline_data,
-            x='timestamp',
-            y='count',
-            color='level',
-            title="Log Levels Over Time",
+            data,
+            x=x,
+            y=y,
+            color=color,
+            title=title,
             color_discrete_map=_self.colors
         )
         fig.update_layout(
-            xaxis_title="Time",
+            xaxis_title="Hour",
             yaxis_title="Count",
             plot_bgcolor='#f0ede6',
             paper_bgcolor='#f0ede6',
@@ -108,11 +124,35 @@ class Visualizer:
         )
         return fig
 
+    @st.cache_data
+    def _create_bar_figure(_self, data, x, y, color=None, title=None):
+        """Create cached bar figure."""
+        fig = px.bar(
+            data,
+            x=x,
+            y=y,
+            color=color,
+            title=title,
+            color_discrete_map=_self.colors if color in _self.colors else None
+        )
+        fig.update_layout(
+            xaxis=dict(tickangle=45),
+            plot_bgcolor='#f0ede6',
+            paper_bgcolor='#f0ede6',
+            font_color='#1A1A1A',
+            title_font_color='#12133f',
+            legend_title_font_color='#1A1A1A',
+            font_size=14,
+            height=400,
+            margin=dict(t=50, b=100, l=50, r=50)
+        )
+        return fig
+
     def _render_log_form(self, df, table_type, log_processor):
         """Render form with dropdowns, button, and paginated log table."""
         index_col = 'class' if table_type == 'class' else 'service'
         logs_to_display = (st.session_state.logs_to_display_class if table_type == 'class'
-                           else st.session_state.logs_to_display_service)
+                          else st.session_state.logs_to_display_service)
         total_logs = (st.session_state.total_logs_class if table_type == 'class'
                       else st.session_state.total_logs_service)
         selected_index = (st.session_state.selected_class if table_type == 'class'
@@ -120,9 +160,9 @@ class Visualizer:
         selected_level = (st.session_state.selected_class_level if table_type == 'class'
                           else st.session_state.selected_service_level)
 
-        if (st.session_state.get('app_state') != 'RUNNING' and 
-            not df.empty and 
-            df.iloc[:, 1:].sum().sum() > 0):
+        if (st.session_state.get('app_state') != 'RUNNING' and
+                not df.empty and
+                df.iloc[:, 1:].sum().sum() > 0):
             with st.container():
                 st.markdown(f"### Select {table_type.capitalize()} and Log Level")
                 col1, col2 = st.columns(2)
@@ -193,6 +233,7 @@ class Visualizer:
                         align-items: center;
                         margin: 15px 0;
                         gap: 15px;
+                        font-family: 'Inter', sans-serif;
                     }
                     .pagination-container select {
                         padding: 8px;
@@ -207,12 +248,6 @@ class Visualizer:
                         justify-content: center;
                         gap: 15px;
                         margin-top: 15px;
-                    }
-                    .control-buttons button {
-                        padding: 10px 20px;
-                        border-radius: 6px;
-                        font-size: 1em;
-                        cursor: pointer;
                     }
                     .download-button > button {
                         background: #38A169;
@@ -239,13 +274,13 @@ class Visualizer:
                     args={"class": "fetch-logs-button"}
                 ):
                     self._load_logs(
-                        st.session_state[f"{table_type}_select"], 
-                        st.session_state[f"{table_type}_level_select"], 
-                        table_type, 
-                        log_processor, 
+                        st.session_state[f"{table_type}_select"],
+                        st.session_state[f"{table_type}_level_select"],
+                        table_type,
+                        log_processor,
                         page=1
                     )
-                
+
                 try:
                     if logs_to_display:
                         logger.debug(f"Rendering {len(logs_to_display)} logs for {table_type}")
@@ -253,10 +288,10 @@ class Visualizer:
                             st.subheader(f"{selected_level} Logs for {table_type.capitalize()} {selected_index}")
                             log_df = pd.DataFrame(logs_to_display)
                             logger.debug(f"Created DataFrame with {len(log_df)} rows")
-                            
+
                             logs_per_page = st.session_state.logs_per_page
                             total_filtered_pages = (total_logs + logs_per_page - 1) // logs_per_page
-                            
+
                             col1, col2 = st.columns([3, 1])
                             with col1:
                                 search_query = st.text_input(
@@ -265,7 +300,6 @@ class Visualizer:
                                     placeholder="Enter keyword or regex..."
                                 )
                             with col2:
-                                # Sync checkbox with reset state
                                 regex_key = f"regex_{table_type}"
                                 reset_key = f"reset_regex_{table_type}"
                                 regex_value = False if st.session_state.get(reset_key, False) else st.session_state.get(regex_key, False)
@@ -274,27 +308,27 @@ class Visualizer:
                                     key=regex_key,
                                     value=regex_value
                                 )
-                            
+
                             if search_query != st.session_state.get(f'search_query_{table_type}', ''):
                                 st.session_state[f'search_query_{table_type}'] = search_query
                                 st.session_state.log_page = 1
                                 self._load_logs(
-                                    selected_index, 
-                                    selected_level, 
-                                    table_type, 
-                                    log_processor, 
-                                    page=1, 
-                                    search_query=search_query, 
+                                    selected_index,
+                                    selected_level,
+                                    table_type,
+                                    log_processor,
+                                    page=1,
+                                    search_query=search_query,
                                     use_regex=st.session_state.get(regex_key, False)
                                 )
                                 log_df = pd.DataFrame(logs_to_display)
                                 total_logs = (st.session_state.total_logs_class if table_type == 'class'
                                               else st.session_state.total_logs_service)
                                 total_filtered_pages = (total_logs + logs_per_page - 1) // logs_per_page
-                            
+
                             if st.session_state.log_page > total_filtered_pages:
                                 st.session_state.log_page = max(1, total_filtered_pages)
-                            
+
                             with st.container():
                                 st.markdown('<div class="pagination-container">', unsafe_allow_html=True)
                                 col1, col2, col3 = st.columns([1, 2, 1])
@@ -302,12 +336,12 @@ class Visualizer:
                                     if st.button("Previous", key=f"prev_{table_type}", disabled=st.session_state.log_page <= 1):
                                         st.session_state.log_page = max(1, st.session_state.log_page - 1)
                                         self._load_logs(
-                                            selected_index, 
-                                            selected_level, 
-                                            table_type, 
-                                            log_processor, 
-                                            page=st.session_state.log_page, 
-                                            search_query=search_query, 
+                                            selected_index,
+                                            selected_level,
+                                            table_type,
+                                            log_processor,
+                                            page=st.session_state.log_page,
+                                            search_query=search_query,
                                             use_regex=st.session_state.get(regex_key, False)
                                         )
                                         logger.debug(f"Navigated to page {st.session_state.log_page}")
@@ -323,12 +357,12 @@ class Visualizer:
                                     if selected_page != st.session_state.log_page:
                                         st.session_state.log_page = selected_page
                                         self._load_logs(
-                                            selected_index, 
-                                            selected_level, 
-                                            table_type, 
-                                            log_processor, 
-                                            page=st.session_state.log_page, 
-                                            search_query=search_query, 
+                                            selected_index,
+                                            selected_level,
+                                            table_type,
+                                            log_processor,
+                                            page=st.session_state.log_page,
+                                            search_query=search_query,
                                             use_regex=st.session_state.get(regex_key, False)
                                         )
                                         logger.debug(f"Selected page {st.session_state.log_page}")
@@ -340,17 +374,17 @@ class Visualizer:
                                     if st.button("Next", key=f"next_{table_type}", disabled=st.session_state.log_page >= total_filtered_pages):
                                         st.session_state.log_page = min(total_filtered_pages, st.session_state.log_page + 1)
                                         self._load_logs(
-                                            selected_index, 
-                                            selected_level, 
-                                            table_type, 
-                                            log_processor, 
-                                            page=st.session_state.log_page, 
-                                            search_query=search_query, 
+                                            selected_index,
+                                            selected_level,
+                                            table_type,
+                                            log_processor,
+                                            page=st.session_state.log_page,
+                                            search_query=search_query,
                                             use_regex=st.session_state.get(regex_key, False)
                                         )
                                         logger.debug(f"Navigated to page {st.session_state.log_page}")
                                 st.markdown('</div>', unsafe_allow_html=True)
-                            
+
                             try:
                                 st.dataframe(
                                     log_df,
@@ -367,7 +401,7 @@ class Visualizer:
                             except Exception as e:
                                 logger.error(f"Failed to render st.dataframe: {str(e)}\n{traceback.format_exc()}")
                                 st.error(f"Error rendering logs: {str(e)}")
-                            
+
                             try:
                                 st.markdown('<div class="control-buttons">', unsafe_allow_html=True)
                                 col1, col2 = st.columns(2)
@@ -394,6 +428,7 @@ class Visualizer:
                 except Exception as e:
                     logger.error(f"Error rendering log form for {table_type}: {str(e)}\n{traceback.format_exc()}")
                     st.error(f"Error processing log form: {str(e)}")
+                
 
     def _load_logs(self, index_col, level, table_type, log_processor, page=1, search_query=None, use_regex=False):
         """Load logs for the selected class/service and level for the specified page."""
@@ -431,7 +466,7 @@ class Visualizer:
                     logger.info(f"No valid logs found for {table_type} {index_col} and level {level}")
                 else:
                     logger.info(f"Loaded {len(logs)} logs for {table_type} {index_col} and level {level}, page {page}, total {total_logs}")
-                st.rerun()
+                    st.rerun()
         except Exception as e:
             st.session_state.notifications.append({
                 'type': 'error',
@@ -450,24 +485,24 @@ class Visualizer:
                 st.session_state.selected_class = None
                 st.session_state.selected_class_level = None
                 st.session_state.search_query_class = ''
-                st.session_state.reset_regex_class = True  # Signal to reset checkbox
+                st.session_state.reset_regex_class = True
             else:
                 st.session_state.logs_to_display_service = []
                 st.session_state.total_logs_service = 0
                 st.session_state.selected_service = None
                 st.session_state.selected_service_level = None
                 st.session_state.search_query_service = ''
-                st.session_state.reset_regex_service = True  # Signal to reset checkbox
+                st.session_state.reset_regex_service = True
             st.session_state.log_page = 1
             logger.debug(f"Cleared logs and state for {table_type}")
-            st.rerun()  # Force refresh to update UI
+            st.rerun()
         except Exception as e:
             logger.error(f"Error clearing logs for {table_type}: {str(e)}\n{traceback.format_exc()}")
             st.error(f"Error clearing logs: {str(e)}")
             st.rerun()
 
     def display_dashboard(self, level_counts_by_class, level_counts_by_service, timeline_data, class_service_counts, log_processor=None):
-        """Display the complete visualization dashboard."""
+        """Display the complete visualization dashboard for log analysis."""
         logger.info("Starting display_dashboard")
         try:
             with st.container():
@@ -477,7 +512,7 @@ class Visualizer:
                 try:
                     st.subheader("Log Levels Timeline")
                     if not timeline_data.empty:
-                        fig = self._create_timeline_figure(timeline_data)
+                        fig = self._create_timeline_figure(timeline_data, 'timestamp', 'count', 'level', "Log Levels Over Time")
                         st.plotly_chart(fig, use_container_width=True)
                         logger.debug("Displayed timeline graph")
                     else:
@@ -487,105 +522,435 @@ class Visualizer:
                     logger.error(f"Error rendering timeline: {str(e)}\n{traceback.format_exc()}")
                     st.error(f"Error rendering timeline: {str(e)}")
 
-            # Log Level Counts Tables and Log Forms
-            with st.container():
-                try:
-                    st.subheader("Log Level Counts by Class")
-                    if not level_counts_by_class.empty and level_counts_by_class.iloc[:, 1:].sum().sum() > 0:
-                        st.dataframe(level_counts_by_class, use_container_width=True)
-                        self._render_log_form(level_counts_by_class, 'class', log_processor)
-                        logger.debug("Displayed log level counts and form for class")
-                    else:
-                        st.warning("No log level counts by class available. Ensure logs contain valid 'timestamp' and 'class' fields.")
-                        logger.warning("No data for log level counts by class")
-                except Exception as e:
-                    logger.error(f"Error rendering class log counts: {str(e)}\n{traceback.format_exc()}")
-                    st.error(f"Error rendering class log counts: {str(e)}")
+                # Log Level Counts Tables and Log Forms
+                with st.container():
+                    try:
+                        st.subheader("Log Level Counts by Class")
+                        if not level_counts_by_class.empty and level_counts_by_class.iloc[:, 1:].sum().sum() > 0:
+                            st.dataframe(level_counts_by_class, use_container_width=True)
+                            self._render_log_form(level_counts_by_class, 'class', log_processor)
+                            logger.debug("Displayed log level counts and form for class")
+                        else:
+                            st.warning("No log level counts by class available. Ensure logs contain valid 'timestamp' and 'class' fields.")
+                            logger.warning("No data for log level counts by class")
+                    except Exception as e:
+                        logger.error(f"Error rendering class log counts: {str(e)}\n{traceback.format_exc()}")
+                        st.error(f"Error rendering class log counts: {str(e)}")
 
-            with st.container():
-                try:
-                    st.subheader("Log Level Counts by Service")
-                    if not level_counts_by_service.empty and level_counts_by_service.iloc[:, 1:].sum().sum() > 0:
-                        st.dataframe(level_counts_by_service, use_container_width=True)
-                        self._render_log_form(level_counts_by_service, 'service', log_processor)
-                        logger.debug("Displayed log level counts and form for service")
-                    else:
-                        st.warning("No log level counts by service available. Ensure logs contain valid 'timestamp' and 'service' fields.")
-                        logger.warning("No data for log level counts by service")
-                except Exception as e:
-                    logger.error(f"Error rendering service log counts: {str(e)}\n{traceback.format_exc()}")
-                    st.error(f"Error rendering service log counts: {str(e)}")
+                with st.container():
+                    try:
+                        st.subheader("Log Level Counts by Service")
+                        if not level_counts_by_service.empty and level_counts_by_service.iloc[:, 1:].sum().sum() > 0:
+                            st.dataframe(level_counts_by_service, use_container_width=True)
+                            self._render_log_form(level_counts_by_service, 'service', log_processor)
+                            logger.debug("Displayed log level counts and form for service")
+                        else:
+                            st.warning("No log level counts by service available. Ensure logs contain valid 'timestamp' and 'service' fields.")
+                            logger.warning("No data for log level counts by service")
+                    except Exception as e:
+                        logger.error(f"Error rendering service log counts: {str(e)}\n{traceback.format_exc()}")
+                        st.error(f"Error rendering service log counts: {str(e)}")
 
-            # Pie Charts
-            with st.container():
-                try:
-                    st.subheader("Logs by Class")
-                    if not class_service_counts.empty:
-                        class_counts = class_service_counts.groupby('class')['count'].sum().reset_index()
-                        fig = self._create_pie_figure(class_counts, 'class', 'count', "Distribution by Class")
-                        st.plotly_chart(fig, use_container_width=True)
-                        logger.debug("Displayed pie chart for class distribution")
-                    else:
-                        st.warning("No class distribution data available. Ensure logs contain valid 'class' fields.")
-                        logger.warning("No data for class pie chart")
-                except Exception as e:
-                    logger.error(f"Error rendering class pie chart: {str(e)}\n{traceback.format_exc()}")
-                    st.error(f"Error rendering class pie chart: {str(e)}")
+                # Pie Charts
+                with st.container():
+                    try:
+                        st.subheader("Logs by Class")
+                        if not class_service_counts.empty:
+                            class_counts = class_service_counts.groupby('class')['count'].sum().reset_index()
+                            fig = self._create_pie_figure(class_counts, 'class', 'count', "Distribution by Class")
+                            st.plotly_chart(fig, use_container_width=True)
+                            logger.debug("Displayed pie chart for class distribution")
+                        else:
+                            st.warning("No class distribution data available. Ensure logs contain valid 'class' fields.")
+                            logger.warning("No data for class pie chart")
+                    except Exception as e:
+                        logger.error(f"Error rendering class pie chart: {str(e)}\n{traceback.format_exc()}")
+                        st.error(f"Error rendering class pie chart: {str(e)}")
 
-            with st.container():
-                try:
-                    st.subheader("Logs by Service")
-                    if not class_service_counts.empty:
-                        service_counts = class_service_counts.groupby('service')['count'].sum().reset_index()
-                        fig = self._create_pie_figure(service_counts, 'service', 'count', "Distribution by Service")
-                        st.plotly_chart(fig, use_container_width=True)
-                        logger.debug("Displayed pie chart for service distribution")
-                    else:
-                        st.warning("No service distribution data available. Ensure logs contain valid 'service' fields.")
-                        logger.warning("No data for service pie chart")
-                except Exception as e:
-                    logger.error(f"Error rendering service pie chart: {str(e)}\n{traceback.format_exc()}")
-                    st.error(f"Error rendering service pie chart: {str(e)}")
+                with st.container():
+                    try:
+                        st.subheader("Logs by Service")
+                        if not class_service_counts.empty:
+                            service_counts = class_service_counts.groupby('service')['count'].sum().reset_index()
+                            fig = self._create_pie_figure(service_counts, 'service', 'count', "Distribution by Service")
+                            st.plotly_chart(fig, use_container_width=True)
+                            logger.debug("Displayed pie chart for service distribution")
+                        else:
+                            st.warning("No service distribution data available. Ensure logs contain valid 'service' fields.")
+                            logger.warning("No data for service pie chart")
+                    except Exception as e:
+                        logger.error(f"Error rendering service pie chart: {str(e)}\n{traceback.format_exc()}")
+                        st.error(f"Error rendering service pie chart: {str(e)}")
 
-            # Detailed Breakdown by Log Level
-            with st.container():
-                try:
-                    st.subheader("Detailed Breakdown by Log Level")
-                    for level in self.config['app']['log_levels']:
-                        with st.expander(f"{level} Logs", expanded=False):
-                            col1, col2 = st.columns(2)
-                            with col1:
-                                st.write("By Class")
-                                if level in level_counts_by_class.columns:
-                                    class_data = level_counts_by_class[['class', level]].copy()
-                                    class_data = class_data[class_data[level] > 0].rename(columns={level: 'count'})
-                                    if not class_data.empty:
-                                        st.dataframe(class_data, use_container_width=True)
-                                        logger.debug(f"Displayed {level} logs by class")
+                # Detailed Breakdown by Log Level
+                with st.container():
+                    try:
+                        st.subheader("Detailed Breakdown by Log Level")
+                        for level in self.config['app']['log_levels']:
+                            with st.expander(f"{level} Logs", expanded=False):
+                                col1, col2 = st.columns(2)
+                                with col1:
+                                    st.write("By Class")
+                                    if level in level_counts_by_class.columns:
+                                        class_data = level_counts_by_class[['class', level]].copy()
+                                        class_data = class_data[class_data[level] > 0].rename(columns={level: 'count'})
+                                        if not class_data.empty:
+                                            st.dataframe(class_data, use_container_width=True)
+                                            logger.debug(f"Displayed {level} logs by class")
+                                        else:
+                                            st.info(f"No {level} logs by class")
+                                            logger.debug(f"No data for {level} logs by class")
                                     else:
-                                        st.info(f"No {level} logs by class")
-                                        logger.debug(f"No data for {level} logs by class")
-                                else:
-                                    st.info(f"No {level} logs by class (level not present in data)")
-                                    logger.debug(f"Level {level} not in level_counts_by_class columns")
-                            with col2:
-                                st.write("By Service")
-                                if level in level_counts_by_service.columns:
-                                    service_data = level_counts_by_service[['service', level]].copy()
-                                    service_data = service_data[service_data[level] > 0].rename(columns={level: 'count'})
-                                    if not service_data.empty:
-                                        st.dataframe(service_data, use_container_width=True)
-                                        logger.debug(f"Displayed {level} logs by service")
+                                        st.info(f"No {level} logs by class (level not present in data)")
+                                        logger.debug(f"Level {level} not in level_counts_by_class columns")
+                                with col2:
+                                    st.write("By Service")
+                                    if level in level_counts_by_service.columns:
+                                        service_data = level_counts_by_service[['service', level]].copy()
+                                        service_data = service_data[service_data[level] > 0].rename(columns={level: 'count'})
+                                        if not service_data.empty:
+                                            st.dataframe(service_data, use_container_width=True)
+                                            logger.debug(f"Displayed {level} logs by service")
+                                        else:
+                                            st.info(f"No {level} logs by service")
+                                            logger.debug(f"No data for {level} logs by service")
                                     else:
-                                        st.info(f"No {level} logs by service")
-                                        logger.debug(f"No data for {level} logs by service")
-                                else:
-                                    st.info(f"No {level} logs by service (level not present in data)")
-                                    logger.debug(f"Level {level} not in level_counts_by_service columns")
-                except Exception as e:
-                    logger.error(f"Error rendering detailed breakdown: {str(e)}\n{traceback.format_exc()}")
-                    st.error(f"Error rendering detailed breakdown: {str(e)}")
-            logger.info("Completed display_dashboard")
+                                        st.info(f"No {level} logs by service (level not present in data)")
+                                        logger.debug(f"Level {level} not in level_counts_by_service columns")
+                    except Exception as e:
+                        logger.error(f"Error rendering detailed breakdown: {str(e)}\n{traceback.format_exc()}")
+                        st.error(f"Error rendering detailed breakdown: {str(e)}")
+                logger.info("Completed display_dashboard")
         except Exception as e:
             logger.error(f"Error displaying dashboard: {str(e)}\n{traceback.format_exc()}")
             st.error(f"Error rendering visualizations: {str(e)}")
+
+    def display_csv_dashboard(self, csv_data):
+        """Display a comprehensive dashboard for uploaded CSV data."""
+        logger.info("Starting display_csv_dashboard")
+        try:
+            with st.container():
+                st.header("CSV Data Visualization Dashboard")
+
+                # Summary of loaded analyses
+                loaded_analyses = list(csv_data.keys())
+                st.subheader("Loaded Analyses")
+                if loaded_analyses:
+                    st.write(f"Loaded {len(loaded_analyses)} analyses: {', '.join(loaded_analyses)}")
+                    missing_analyses = [a for a in self.expected_analyses if a not in loaded_analyses]
+                    if missing_analyses:
+                        st.warning(f"Missing analyses: {', '.join(missing_analyses)}. Upload corresponding CSV files (e.g., {missing_analyses[0]}_YYYYMMDD_HHMMSS.csv).")
+                    logger.debug(f"Loaded analyses: {loaded_analyses}, missing: {missing_analyses}")
+                else:
+                    st.warning("No analyses loaded. Upload CSV files with names like time_range_YYYYMMDD_HHMMSS.csv.")
+                    logger.warning("No analyses loaded for CSV dashboard")
+                    return
+
+                # Time Range
+                if 'time_range' in csv_data and not csv_data['time_range'].empty:
+                    st.subheader("Time Range Analysis")
+                    try:
+                        time_range = csv_data['time_range']
+                        required_columns = ['start_time', 'end_time']
+                        if not all(col in time_range.columns for col in required_columns):
+                            st.warning("Time range CSV missing required columns: start_time, end_time.")
+                            logger.error("Time range CSV missing required columns")
+                        else:
+                            start_time = pd.to_datetime(time_range['start_time'].iloc[0])
+                            end_time = pd.to_datetime(time_range['end_time'].iloc[0])
+                            duration_hours = (end_time - start_time).total_seconds() / 3600
+                            st.write(f"**Start Time:** {start_time}")
+                            st.write(f"**End Time:** {end_time}")
+                            st.write(f"**Duration (Hours):** {duration_hours:.2f}")
+                            logger.debug("Displayed time range analysis")
+                    except Exception as e:
+                        st.warning("Error processing time range data. Ensure valid datetime format in start_time and end_time.")
+                        logger.error(f"Error displaying time_range: {str(e)}")
+                else:
+                    st.warning("Time range analysis not available. Upload time_range_YYYYMMDD_HHMMSS.csv.")
+                    logger.debug("No time_range data available")
+
+                # Log Level Distribution
+                if 'level_summary' in csv_data and not csv_data['level_summary'].empty:
+                    st.subheader("Log Level Distribution")
+                    try:
+                        level_summary = csv_data['level_summary']
+                        required_columns = ['level', 'count']
+                        if not all(col in level_summary.columns for col in required_columns):
+                            st.warning("Level summary CSV missing required columns: level, count.")
+                            logger.error("Level summary CSV missing required columns")
+                        else:
+                            fig = self._create_pie_figure(level_summary, 'level', 'count', "Log Level Distribution")
+                            st.plotly_chart(fig, use_container_width=True)
+                            st.dataframe(level_summary, use_container_width=True)
+                            logger.debug("Displayed log level distribution")
+                    except Exception as e:
+                        st.warning("Error displaying log level distribution. Ensure level_summary.csv has valid data.")
+                        logger.error(f"Error displaying level_summary: {str(e)}")
+                else:
+                    st.warning("Log level distribution not available. Upload level_summary_YYYYMMDD_HHMMSS.csv.")
+                    logger.debug("No level_summary data available")
+
+                # Class Summary
+                if 'class_summary' in csv_data and not csv_data['class_summary'].empty:
+                    st.subheader("Class Distribution")
+                    try:
+                        class_summary = csv_data['class_summary']
+                        required_columns = ['class', 'count']
+                        if not all(col in class_summary.columns for col in required_columns):
+                            st.warning("Class summary CSV missing required columns: class, count.")
+                            logger.error("Class summary CSV missing required columns")
+                        else:
+                            fig = self._create_bar_figure(class_summary.head(10), 'class', 'count', title="Top 10 Classes by Log Count")
+                            st.plotly_chart(fig, use_container_width=True)
+                            st.dataframe(class_summary, use_container_width=True)
+                            logger.debug("Displayed class distribution")
+                    except Exception as e:
+                        st.warning("Error displaying class distribution. Ensure class_summary.csv has valid data.")
+                        logger.error(f"Error displaying class_summary: {str(e)}")
+                else:
+                    st.warning("Class distribution not available. Upload class_summary_YYYYMMDD_HHMMSS.csv.")
+                    logger.debug("No class_summary data available")
+
+                # Pod Summary
+                if 'pod_summary' in csv_data and not csv_data['pod_summary'].empty:
+                    st.subheader("Pod Distribution")
+                    try:
+                        pod_summary = csv_data['pod_summary']
+                        required_columns = ['pod', 'count']
+                        if not all(col in pod_summary.columns for col in required_columns):
+                            st.warning("Pod summary CSV missing required columns: pod, count.")
+                            logger.error("Pod summary CSV missing required columns")
+                        else:
+                            fig = self._create_bar_figure(pod_summary.head(10), 'pod', 'count', title="Top 10 Pods by Log Count")
+                            st.plotly_chart(fig, use_container_width=True)
+                            st.dataframe(pod_summary, use_container_width=True)
+                            logger.debug("Displayed pod distribution")
+                    except Exception as e:
+                        st.warning("Error displaying pod distribution. Ensure pod_summary.csv has valid data.")
+                        logger.error(f"Error displaying pod_summary: {str(e)}")
+                else:
+                    st.warning("Pod distribution not available. Upload pod_summary_YYYYMMDD_HHMMSS.csv.")
+                    logger.debug("No pod_summary data available")
+
+                # Container Summary
+                if 'container_summary' in csv_data and not csv_data['container_summary'].empty:
+                    st.subheader("Container Distribution")
+                    try:
+                        container_summary = csv_data['container_summary']
+                        required_columns = ['container', 'count']
+                        if not all(col in container_summary.columns for col in required_columns):
+                            st.warning("Container summary CSV missing required columns: container, count.")
+                            logger.error("Container summary CSV missing required columns")
+                        else:
+                            fig = self._create_bar_figure(container_summary.head(10), 'container', 'count', title="Top 10 Containers by Log Count")
+                            st.plotly_chart(fig, use_container_width=True)
+                            st.dataframe(container_summary, use_container_width=True)
+                            logger.debug("Displayed container distribution")
+                    except Exception as e:
+                        st.warning("Error displaying container distribution. Ensure container_summary.csv has valid data.")
+                        logger.error(f"Error displaying container_summary: {str(e)}")
+                else:
+                    st.warning("Container distribution not available. Upload container_summary_YYYYMMDD_HHMMSS.csv.")
+                    logger.debug("No container_summary data available")
+
+                # Host Summary
+                if 'host_summary' in csv_data and not csv_data['host_summary'].empty:
+                    st.subheader("Host Distribution")
+                    try:
+                        host_summary = csv_data['host_summary']
+                        required_columns = ['host', 'count']
+                        if not all(col in host_summary.columns for col in required_columns):
+                            st.warning("Host summary CSV missing required columns: host, count.")
+                            logger.error("Host summary CSV missing required columns")
+                        else:
+                            fig = self._create_bar_figure(host_summary.head(10), 'host', 'count', title="Top 10 Hosts by Log Count")
+                            st.plotly_chart(fig, use_container_width=True)
+                            st.dataframe(host_summary, use_container_width=True)
+                            logger.debug("Displayed host distribution")
+                    except Exception as e:
+                        st.warning("Error displaying host distribution. Ensure host_summary.csv has valid data.")
+                        logger.error(f"Error displaying host_summary: {str(e)}")
+                else:
+                    st.warning("Host distribution not available. Upload host_summary_YYYYMMDD_HHMMSS.csv.")
+                    logger.debug("No host_summary data available")
+
+                # Thread Summary
+                if 'thread_summary' in csv_data and not csv_data['thread_summary'].empty:
+                    st.subheader("Thread Distribution")
+                    try:
+                        thread_summary = csv_data['thread_summary']
+                        required_columns = ['thread', 'count']
+                        if not all(col in thread_summary.columns for col in required_columns):
+                            st.warning("Thread summary CSV missing required columns: thread, count.")
+                            logger.error("Thread summary CSV missing required columns")
+                        else:
+                            fig = self._create_bar_figure(thread_summary.head(10), 'thread', 'count', title="Top 10 Threads by Log Count")
+                            st.plotly_chart(fig, use_container_width=True)
+                            st.dataframe(thread_summary, use_container_width=True)
+                            logger.debug("Displayed thread distribution")
+                    except Exception as e:
+                        st.warning("Error displaying thread distribution. Ensure thread_summary.csv has valid data.")
+                        logger.error(f"Error displaying thread_summary: {str(e)}")
+                else:
+                    st.warning("Thread distribution not available. Upload thread_summary_YYYYMMDD_HHMMSS.csv.")
+                    logger.debug("No thread_summary data available")
+
+                # Hourly Log Level Counts
+                if 'hourly_level_counts' in csv_data and not csv_data['hourly_level_counts'].empty:
+                    st.subheader("Hourly Log Level Counts")
+                    try:
+                        hourly_counts = csv_data['hourly_level_counts']
+                        required_columns = ['hour']
+                        available_levels = [col for col in hourly_counts.columns if col in self.config['app']['log_levels']]
+                        if 'hour' not in hourly_counts.columns:
+                            st.warning("Hourly level counts CSV missing required column: hour.")
+                            logger.error("Hourly level counts CSV missing column: hour")
+                        elif not available_levels:
+                            st.warning("Hourly level counts CSV has no recognized log level columns (expected: DEBUG, INFO, WARN, ERROR, FATAL).")
+                            logger.error("Hourly level counts CSV has no recognized log level columns")
+                        else:
+                            logger.debug(f"Found log levels for hourly_counts: {available_levels}")
+                            if len(available_levels) < len(self.config['app']['log_levels']):
+                                missing_levels = [lvl for lvl in self.config['app']['log_levels'] if lvl not in available_levels]
+                                st.info(f"Using available log levels: {', '.join(available_levels)}. Missing: {', '.join(missing_levels)}.")
+                            hourly_counts_melted = hourly_counts.melt(
+                                id_vars=['hour'],
+                                value_vars=available_levels,
+                                var_name='Level',
+                                value_name='Count'
+                            )
+                            hourly_counts_melted['hour'] = hourly_counts_melted['hour'].astype(float)
+                            fig = self._create_timeline_figure(
+                                hourly_counts_melted,
+                                'hour',
+                                'Count',
+                                'Level',
+                                "Hourly Log Level Trends"
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                            st.dataframe(hourly_counts, use_container_width=True)
+                            logger.debug("Displayed hourly log level timeline")
+                    except Exception as e:
+                        st.warning("Error displaying hourly log level counts. Ensure hourly_level_counts.csv has valid data.")
+                        logger.error(f"Error displaying hourly_level_counts: {str(e)}")
+                else:
+                    st.warning("Hourly log level counts not available. Upload hourly_level_counts_YYYYMMDD_HHMMSS.csv.")
+                    logger.debug("No hourly_level_counts data available")
+
+                # Class-Level Pie Charts
+                if 'class_level_counts' in csv_data and not csv_data['class_level_counts'].empty:
+                    st.subheader("Log Levels by Class")
+                    try:
+                        class_level = csv_data['class_level_counts']
+                        required_columns = ['class']
+                        available_levels = [col for col in class_level.columns if col in self.config['app']['log_levels']]
+                        if 'class' not in class_level.columns:
+                            st.warning("Class level counts CSV missing required column: class.")
+                            logger.error("Class level counts CSV missing column: class")
+                        elif not available_levels:
+                            st.warning("Class level counts CSV has no recognized log level columns (expected: DEBUG, INFO, WARN, ERROR, FATAL).")
+                            logger.error("Class level counts CSV has no recognized log level columns")
+                        else:
+                            logger.debug(f"Found log levels for class_level_counts: {available_levels}")
+                            if len(available_levels) < len(self.config['app']['log_levels']):
+                                missing_levels = [lvl for lvl in self.config['app']['log_levels'] if lvl not in available_levels]
+                                st.info(f"Using available log levels: {', '.join(available_levels)}. Missing: {', '.join(missing_levels)}.")
+                            for level in available_levels:
+                                with st.expander(f"{level} Logs by Class", expanded=False):
+                                    level_data = class_level[['class', level]].copy()
+                                    level_data = level_data[level_data[level] > 0].rename(columns={level: 'Count'})
+                                    if not level_data.empty:
+                                        fig = self._create_pie_figure(
+                                            level_data,
+                                            'class',
+                                            'Count',
+                                            f"{level} Log Distribution by Class"
+                                        )
+                                        st.plotly_chart(fig, use_container_width=True)
+                                        st.dataframe(level_data, use_container_width=True)
+                                        logger.debug(f"Displayed {level} pie chart for class_level_counts")
+                                    else:
+                                        st.info(f"No {level} logs found for any class.")
+                                        logger.debug(f"No data for {level} in class_level_counts")
+                    except Exception as e:
+                        st.warning("Error displaying log levels by class. Ensure class_level_counts.csv has valid data.")
+                        logger.error(f"Error displaying class_level_counts: {str(e)}")
+                else:
+                    st.warning("Log levels by class not available. Upload class_level_counts_YYYYMMDD_HHMMSS.csv.")
+                    logger.debug("No class_level_counts data available")
+
+                # Class-Pod-Level Pie Charts
+                if 'class_level_pod' in csv_data and not csv_data['class_level_pod'].empty:
+                    st.subheader("Log Levels by Class and Pod")
+                    try:
+                        class_level_pod = csv_data['class_level_pod']
+                        required_columns = ['class', 'pod']
+                        available_levels = [col for col in class_level_pod.columns if col in self.config['app']['log_levels']]
+                        if not all(col in class_level_pod.columns for col in required_columns):
+                            st.warning("Class level pod CSV missing required columns: class, pod.")
+                            logger.error("Class level pod CSV missing required columns")
+                        elif not available_levels:
+                            st.warning("Class level pod CSV has no recognized log level columns (expected: DEBUG, INFO, WARN, ERROR, FATAL).")
+                            logger.error("Class level pod CSV has no recognized log level columns")
+                        else:
+                            logger.debug(f"Found log levels for class_level_pod: {available_levels}")
+                            if len(available_levels) < len(self.config['app']['log_levels']):
+                                missing_levels = [lvl for lvl in self.config['app']['log_levels'] if lvl not in available_levels]
+                                st.info(f"Using available log levels: {', '.join(available_levels)}. Missing: {', '.join(missing_levels)}.")
+                            for level in available_levels:
+                                with st.expander(f"{level} Logs by Class and Pod", expanded=False):
+                                    level_data = class_level_pod[['class', 'pod', level]].copy()
+                                    level_data['Class_Pod'] = level_data['class'] + ' / ' + level_data['pod']
+                                    level_data = level_data[level_data[level] > 0][['Class_Pod', level]].rename(columns={level: 'Count'})
+                                    if not level_data.empty:
+                                        fig = self._create_pie_figure(
+                                            level_data,
+                                            'Class_Pod',
+                                            'Count',
+                                            f"{level} Log Distribution by Class and Pod"
+                                        )
+                                        st.plotly_chart(fig, use_container_width=True)
+                                        st.dataframe(level_data[['Class_Pod', 'Count']], use_container_width=True)
+                                        logger.debug(f"Displayed {level} pie chart for class_level_pod")
+                                    else:
+                                        st.info(f"No {level} logs found for any class/pod combination.")
+                                        logger.debug(f"No data for {level} in class_level_pod")
+                    except Exception as e:
+                        st.warning("Error displaying log levels by class and pod. Ensure class_level_pod.csv has valid data.")
+                        logger.error(f"Error displaying class_level_pod: {str(e)}")
+                else:
+                    st.warning("Log levels by class and pod not available. Upload class_level_pod_YYYYMMDD_HHMMSS.csv.")
+                    logger.debug("No class_level_pod data available")
+
+                # Error Analysis
+                if 'error_analysis' in csv_data and not csv_data['error_analysis'].empty:
+                    st.subheader("Error Analysis")
+                    try:
+                        error_analysis = csv_data['error_analysis']
+                        required_columns = ['class', 'pod', 'count']
+                        if not all(col in error_analysis.columns for col in required_columns):
+                            st.warning("Error analysis CSV missing required columns: class, pod, count.")
+                            logger.error("Error analysis CSV missing required columns")
+                        else:
+                            error_analysis['Class_Pod'] = error_analysis['class'] + ' / ' + error_analysis['pod']
+                            fig = self._create_bar_figure(
+                                error_analysis.head(10),
+                                'Class_Pod',
+                                'count',
+                                title="Top 10 Error Counts by Class and Pod"
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                            st.dataframe(error_analysis[['class', 'pod', 'count']], use_container_width=True)
+                            logger.debug("Displayed error analysis")
+                    except Exception as e:
+                        st.warning("Error displaying error analysis. Ensure error_analysis.csv has valid data.")
+                        logger.error(f"Error displaying error_analysis: {str(e)}")
+                else:
+                    st.warning("Error analysis not available. Upload error_analysis_YYYYMMDD_HHMMSS.csv.")
+                    logger.debug("No error_analysis data available")
+
+                logger.info("Completed display_csv_dashboard")
+        except Exception as e:
+            logger.error(f"Error displaying CSV dashboard: {str(e)}\n{traceback.format_exc()}")
+            st.error(f"Error rendering CSV visualizations: {str(e)}")
