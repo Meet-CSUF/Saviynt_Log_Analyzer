@@ -19,7 +19,12 @@ class Visualizer:
             'INFO': '#38A169',
             'WARN': '#D69E2E',
             'ERROR': '#E53E3E',
-            'FATAL': '#805AD5'
+            'FATAL': '#805AD5',
+            'JOB': '#FF6B6B',
+            'NEW': '#4ECDC4',
+            'TEST': '#45B7D1',
+            'TSAP': '#96CEB4',
+            'UNKNOWN': '#D4A5A5'
         }
         # Expected analysis names
         self.expected_analyses = [
@@ -35,6 +40,8 @@ class Visualizer:
             'error_analysis',
             'time_range'
         ]
+        # Valid log levels for class_level_counts and class_level_pod
+        self.valid_log_levels = ['DEBUG', 'ERROR', 'INFO', 'JOB', 'NEW', 'TEST', 'TSAP', 'UNKNOWN', 'WARN', 'FATAL']
         # Initialize session state
         if 'logs_to_display_class' not in st.session_state:
             st.session_state.logs_to_display_class = []
@@ -77,16 +84,25 @@ class Visualizer:
         st.session_state.selected_service_level = st.session_state.service_level_select
 
     @st.cache_data
-    def _create_timeline_figure(_self, data, x, y, color, title):
-        """Create cached timeline figure."""
-        fig = px.line(
-            data,
-            x=x,
-            y=y,
-            color=color,
-            title=title,
-            color_discrete_map=_self.colors
-        )
+    def _create_timeline_figure(_self, data, x, y, color=None, title=None):
+        """Create cached timeline figure for single or multi-series data."""
+        if color:
+            fig = px.line(
+                data,
+                x=x,
+                y=y,
+                color=color,
+                title=title,
+                color_discrete_map=_self.colors
+            )
+        else:
+            fig = px.line(
+                data,
+                x=x,
+                y=y,
+                title=title,
+                color_discrete_sequence=['#12133f']
+            )
         fig.update_layout(
             xaxis_title="Hour",
             yaxis_title="Count",
@@ -428,7 +444,6 @@ class Visualizer:
                 except Exception as e:
                     logger.error(f"Error rendering log form for {table_type}: {str(e)}\n{traceback.format_exc()}")
                     st.error(f"Error processing log form: {str(e)}")
-                
 
     def _load_logs(self, index_col, level, table_type, log_processor, page=1, search_query=None, use_regex=False):
         """Load logs for the selected class/service and level for the specified page."""
@@ -798,44 +813,32 @@ class Visualizer:
 
                 # Hourly Log Level Counts
                 if 'hourly_level_counts' in csv_data and not csv_data['hourly_level_counts'].empty:
-                    st.subheader("Hourly Log Level Counts")
+                    st.subheader("Hourly Log Counts")
                     try:
                         hourly_counts = csv_data['hourly_level_counts']
-                        required_columns = ['hour']
-                        available_levels = [col for col in hourly_counts.columns if col in self.config['app']['log_levels']]
-                        if 'hour' not in hourly_counts.columns:
-                            st.warning("Hourly level counts CSV missing required column: hour.")
-                            logger.error("Hourly level counts CSV missing column: hour")
-                        elif not available_levels:
-                            st.warning("Hourly level counts CSV has no recognized log level columns (expected: DEBUG, INFO, WARN, ERROR, FATAL).")
-                            logger.error("Hourly level counts CSV has no recognized log level columns")
+                        required_columns = ['hour', 'count']
+                        if not all(col in hourly_counts.columns for col in required_columns):
+                            missing_cols = [col for col in required_columns if col not in hourly_counts.columns]
+                            st.warning(f"Hourly log counts CSV missing required columns: {', '.join(missing_cols)}.")
+                            logger.error(f"Hourly log counts CSV missing columns: {missing_cols}")
                         else:
-                            logger.debug(f"Found log levels for hourly_counts: {available_levels}")
-                            if len(available_levels) < len(self.config['app']['log_levels']):
-                                missing_levels = [lvl for lvl in self.config['app']['log_levels'] if lvl not in available_levels]
-                                st.info(f"Using available log levels: {', '.join(available_levels)}. Missing: {', '.join(missing_levels)}.")
-                            hourly_counts_melted = hourly_counts.melt(
-                                id_vars=['hour'],
-                                value_vars=available_levels,
-                                var_name='Level',
-                                value_name='Count'
-                            )
-                            hourly_counts_melted['hour'] = hourly_counts_melted['hour'].astype(float)
+                            hourly_counts = hourly_counts.sort_values('hour')
+                            hourly_counts['hour'] = hourly_counts['hour'].astype(float)
                             fig = self._create_timeline_figure(
-                                hourly_counts_melted,
+                                hourly_counts,
                                 'hour',
-                                'Count',
-                                'Level',
-                                "Hourly Log Level Trends"
+                                'count',
+                                None,
+                                "Hourly Log Count Trends"
                             )
                             st.plotly_chart(fig, use_container_width=True)
                             st.dataframe(hourly_counts, use_container_width=True)
-                            logger.debug("Displayed hourly log level timeline")
+                            logger.debug("Displayed hourly log count timeline")
                     except Exception as e:
-                        st.warning("Error displaying hourly log level counts. Ensure hourly_level_counts.csv has valid data.")
+                        st.warning("Error displaying hourly log counts. Ensure hourly_level_counts.csv has valid data.")
                         logger.error(f"Error displaying hourly_level_counts: {str(e)}")
                 else:
-                    st.warning("Hourly log level counts not available. Upload hourly_level_counts_YYYYMMDD_HHMMSS.csv.")
+                    st.warning("Hourly log counts not available. Upload hourly_level_counts_YYYYMMDD_HHMMSS.csv.")
                     logger.debug("No hourly_level_counts data available")
 
                 # Class-Level Pie Charts
@@ -844,18 +847,19 @@ class Visualizer:
                     try:
                         class_level = csv_data['class_level_counts']
                         required_columns = ['class']
-                        available_levels = [col for col in class_level.columns if col in self.config['app']['log_levels']]
+                        available_levels = [col for col in class_level.columns if col in self.valid_log_levels]
                         if 'class' not in class_level.columns:
                             st.warning("Class level counts CSV missing required column: class.")
                             logger.error("Class level counts CSV missing column: class")
                         elif not available_levels:
-                            st.warning("Class level counts CSV has no recognized log level columns (expected: DEBUG, INFO, WARN, ERROR, FATAL).")
+                            st.warning(f"Class level counts CSV has no recognized log level columns (expected: {', '.join(self.valid_log_levels)}).")
                             logger.error("Class level counts CSV has no recognized log level columns")
                         else:
                             logger.debug(f"Found log levels for class_level_counts: {available_levels}")
-                            if len(available_levels) < len(self.config['app']['log_levels']):
-                                missing_levels = [lvl for lvl in self.config['app']['log_levels'] if lvl not in available_levels]
-                                st.info(f"Using available log levels: {', '.join(available_levels)}. Missing: {', '.join(missing_levels)}.")
+                            st.info(f"Using available log levels: {', '.join(available_levels)}.")
+                            # Create summary DataFrame
+                            summary_df = class_level[['class'] + available_levels].copy()
+                            summary_df['Total'] = summary_df[available_levels].sum(axis=1)
                             for level in available_levels:
                                 with st.expander(f"{level} Logs by Class", expanded=False):
                                     level_data = class_level[['class', level]].copy()
@@ -873,6 +877,9 @@ class Visualizer:
                                     else:
                                         st.info(f"No {level} logs found for any class.")
                                         logger.debug(f"No data for {level} in class_level_counts")
+                            st.subheader("Class Level Counts Summary")
+                            st.dataframe(summary_df, use_container_width=True)
+                            logger.debug("Displayed class level counts summary DataFrame")
                     except Exception as e:
                         st.warning("Error displaying log levels by class. Ensure class_level_counts.csv has valid data.")
                         logger.error(f"Error displaying class_level_counts: {str(e)}")
@@ -886,18 +893,20 @@ class Visualizer:
                     try:
                         class_level_pod = csv_data['class_level_pod']
                         required_columns = ['class', 'pod']
-                        available_levels = [col for col in class_level_pod.columns if col in self.config['app']['log_levels']]
+                        available_levels = [col for col in class_level_pod.columns if col in self.valid_log_levels]
                         if not all(col in class_level_pod.columns for col in required_columns):
-                            st.warning("Class level pod CSV missing required columns: class, pod.")
-                            logger.error("Class level pod CSV missing required columns")
+                            missing_cols = [col for col in required_columns if col not in class_level_pod.columns]
+                            st.warning(f"Class level pod CSV missing required columns: {', '.join(missing_cols)}.")
+                            logger.error(f"Class level pod CSV missing required columns: {missing_cols}")
                         elif not available_levels:
-                            st.warning("Class level pod CSV has no recognized log level columns (expected: DEBUG, INFO, WARN, ERROR, FATAL).")
+                            st.warning(f"Class level pod CSV has no recognized log level columns (expected: {', '.join(self.valid_log_levels)}).")
                             logger.error("Class level pod CSV has no recognized log level columns")
                         else:
                             logger.debug(f"Found log levels for class_level_pod: {available_levels}")
-                            if len(available_levels) < len(self.config['app']['log_levels']):
-                                missing_levels = [lvl for lvl in self.config['app']['log_levels'] if lvl not in available_levels]
-                                st.info(f"Using available log levels: {', '.join(available_levels)}. Missing: {', '.join(missing_levels)}.")
+                            st.info(f"Using available log levels: {', '.join(available_levels)}.")
+                            # Create summary DataFrame
+                            summary_df = class_level_pod[['class', 'pod'] + available_levels].copy()
+                            summary_df['Total'] = summary_df[available_levels].sum(axis=1)
                             for level in available_levels:
                                 with st.expander(f"{level} Logs by Class and Pod", expanded=False):
                                     level_data = class_level_pod[['class', 'pod', level]].copy()
@@ -916,6 +925,9 @@ class Visualizer:
                                     else:
                                         st.info(f"No {level} logs found for any class/pod combination.")
                                         logger.debug(f"No data for {level} in class_level_pod")
+                            st.subheader("Class and Pod Level Counts Summary")
+                            st.dataframe(summary_df, use_container_width=True)
+                            logger.debug("Displayed class and pod level counts summary DataFrame")
                     except Exception as e:
                         st.warning("Error displaying log levels by class and pod. Ensure class_level_pod.csv has valid data.")
                         logger.error(f"Error displaying class_level_pod: {str(e)}")

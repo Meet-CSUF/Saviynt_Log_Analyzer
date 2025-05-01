@@ -275,7 +275,7 @@ class LogAnalyzer:
 
     def _generate_analyses(self, ddf):
         """
-        Generate analyses using Dask DataFrame with progress tracking.
+        Generate analyses using Dask DataFrame with comprehensive error handling.
         
         Args:
             ddf (dask.DataFrame): Dask DataFrame containing log data
@@ -287,22 +287,57 @@ class LogAnalyzer:
         analyses = {}
         
         try:
-            # Convert timestamps
+            # Validate input DataFrame
+            required_columns = ['timestamp', 'level', 'class', 'pod', 'container', 'host', 'thread']
+            missing_columns = [col for col in required_columns if col not in ddf.columns]
+            if missing_columns:
+                raise ValueError(f"Missing required columns: {', '.join(missing_columns)}")
+
+            # Validate data types and clean data
+            print("Validating and cleaning data...")
+            
+            # Ensure level is uppercase and handle missing values
+            ddf['level'] = ddf['level'].fillna('UNKNOWN').map(lambda x: str(x).upper())
+            
+            # Handle missing values in grouping columns
+            ddf['class'] = ddf['class'].fillna('UNKNOWN')
+            ddf['pod'] = ddf['pod'].fillna('UNKNOWN')
+            ddf['container'] = ddf['container'].fillna('UNKNOWN')
+            ddf['host'] = ddf['host'].fillna('UNKNOWN')
+            ddf['thread'] = ddf['thread'].fillna('UNKNOWN')
+
+            # Convert timestamps with error handling
             print("Converting timestamps...")
-            ddf['parsed_timestamp'] = dd.to_datetime(ddf['timestamp'])
-            ddf['hour'] = ddf['parsed_timestamp'].dt.hour
+            try:
+                ddf['parsed_timestamp'] = dd.to_datetime(
+                    ddf['timestamp'],
+                    format='%d/%b/%Y:%H:%M:%S +0000',
+                    errors='coerce'
+                )
+                # Check for null timestamps after conversion
+                null_timestamps = ddf['parsed_timestamp'].isnull().compute().sum()
+                if null_timestamps > 0:
+                    print(f"Warning: {null_timestamps} timestamps could not be parsed")
+                
+                ddf['hour'] = ddf['parsed_timestamp'].dt.hour
+            except Exception as e:
+                raise ValueError(f"Error parsing timestamps: {str(e)}")
 
             analysis_tasks = [
-                ('class_level_counts', lambda: ddf.groupby(['class', 'level']).size().compute().unstack(fill_value=0).reset_index()),
+                ('class_level_counts', lambda: ddf.groupby(['class', 'level'])
+                    .size().compute().unstack(fill_value=0).reset_index()),
                 ('level_summary', lambda: ddf.level.value_counts().compute()),
                 ('class_summary', lambda: ddf.groupby('class').size().compute()),
                 ('pod_summary', lambda: ddf.groupby('pod').size().compute()),
                 ('container_summary', lambda: ddf.groupby('container').size().compute()),
                 ('host_summary', lambda: ddf.groupby('host').size().compute()),
-                ('class_level_pod', lambda: ddf.groupby(['class', 'pod', 'level']).size().compute().unstack(fill_value=0).reset_index()),
-                ('hourly_level_counts', lambda: ddf.groupby(['hour', 'level']).size().compute().unstack(fill_value=0).reset_index()),
+                ('class_level_pod', lambda: ddf.groupby(['class', 'pod', 'level'])
+                    .size().compute().unstack(fill_value=0).reset_index()),
+                ('hourly_level_counts', lambda: ddf.groupby(['hour', 'level'])
+                    .size().compute().unstack(fill_value=0).reset_index()),
                 ('thread_summary', lambda: ddf.groupby('thread').size().compute()),
-                ('error_analysis', lambda: ddf[ddf.level == 'ERROR'].groupby(['class', 'pod']).size().compute().sort_values(ascending=False)),
+                ('error_analysis', lambda: ddf[ddf.level == 'ERROR']
+                    .groupby(['class', 'pod']).size().compute().sort_values(ascending=False)),
                 ('time_range', lambda: pd.DataFrame([{
                     'start_time': ddf['parsed_timestamp'].min().compute(),
                     'end_time': ddf['parsed_timestamp'].max().compute()
@@ -313,17 +348,40 @@ class LogAnalyzer:
                 for name, task in analysis_tasks:
                     try:
                         pbar.set_description(f"Generating {name}")
-                        analyses[name] = task()
+                        result = task()
+                        
+                        # Validate result is not empty
+                        if result.empty:
+                            print(f"\nWarning: {name} analysis produced empty result")
+                        
+                        analyses[name] = result
                         pbar.update(1)
                     except Exception as e:
-                        print(f"\nError generating {name}: {str(e)}")
-                        raise
+                        error_msg = f"\nError generating {name}: {str(e)}"
+                        print(error_msg)
+                        raise LogAnalysisError(error_msg)
+
+            # Validate final results
+            if not analyses:
+                raise LogAnalysisError("No analyses were generated successfully")
 
             print("\nAll analyses completed successfully!")
+            
+            # Validate time range
+            if 'time_range' in analyses:
+                time_range = analyses['time_range']
+                if time_range['start_time'].iloc[0] > time_range['end_time'].iloc[0]:
+                    print("\nWarning: Start time is after end time in the data")
+
             return analyses
                 
         except Exception as e:
+            if isinstance(e, LogAnalysisError):
+                raise
             raise LogAnalysisError(f"Error generating analyses: {str(e)}")
+        finally:
+            # Clean up any temporary resources if needed
+            pass
 
     def _save_analyses(self):
         """Save analysis results to CSV files."""
