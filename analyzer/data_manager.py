@@ -306,6 +306,12 @@ def _fetch_analysis_data(job_id: str, query_type: str) -> pd.DataFrame:
                 FROM timeline_counts
                 WHERE job_id = ?
             """, conn, params=[job_id])
+            # Convert hour to datetime for timeline queries
+            if not df.empty:
+                df['hour'] = pd.to_datetime(df['hour'], errors='coerce')
+                df = df.dropna(subset=['hour'])  # Drop rows with invalid datetime
+                df = df.sort_values('hour')  # Sort by datetime
+                logger.debug(f"Timeline data for job_id {job_id}: {len(df)} rows after datetime conversion")
         
         elif query_type == 'class_service':
             df = pd.read_sql_query("""
@@ -326,10 +332,11 @@ def _fetch_analysis_data(job_id: str, query_type: str) -> pd.DataFrame:
                 df = pd.DataFrame(columns=['service', 'level', 'count'])
             elif query_type == 'timeline':
                 df = pd.DataFrame(columns=['hour', 'level', 'count'])
+                logger.warning(f"No timeline data found for job_id {job_id}")
             elif query_type == 'class_service':
                 df = pd.DataFrame(columns=['class', 'service', 'count'])
         
-        logger.info(f"Retrieved {query_type} data for job_id: {job_id}")
+        logger.info(f"Retrieved {query_type} data for job_id: {job_id}, rows: {len(df)}")
         return df
     
     except sqlite3.OperationalError as e:

@@ -31,22 +31,42 @@ class Visualizer:
             # Timeline Data
             if not timeline_data.empty:
                 st.markdown("### Log Counts Over Time")
-                fig_timeline = px.line(
-                    timeline_data,
-                    x='hour',
-                    y='count',
-                    color='level',
-                    title="Log Counts by Hour",
-                    labels={'hour': 'Time', 'count': 'Count', 'level': 'Log Level'},
-                    color_discrete_sequence=px.colors.qualitative.Plotly
-                )
-                fig_timeline.update_layout(
-                    xaxis_title="Time",
-                    yaxis_title="Count",
-                    legend_title="Log Level",
-                    xaxis_tickformat="%Y-%m-%d %H:%M"
-                )
-                st.plotly_chart(fig_timeline, use_container_width=True)
+                logger.debug(f"Timeline data shape: {timeline_data.shape}, columns: {timeline_data.columns}")
+                logger.debug(f"Timeline data sample: {timeline_data.head().to_dict()}")
+                
+                # Ensure hour is datetime
+                timeline_data['hour'] = pd.to_datetime(timeline_data['hour'], errors='coerce')
+                timeline_data = timeline_data.dropna(subset=['hour'])
+                
+                if not timeline_data.empty:
+                    fig_timeline = px.line(
+                        timeline_data,
+                        x='hour',
+                        y='count',
+                        color='level',
+                        title="Log Counts by Hour",
+                        labels={'hour': 'Time', 'count': 'Count', 'level': 'Log Level'},
+                        color_discrete_sequence=px.colors.qualitative.Plotly
+                    )
+                    fig_timeline.update_layout(
+                        xaxis_title="Time",
+                        yaxis_title="Count",
+                        legend_title="Log Level",
+                        xaxis_tickformat="%Y-%m-%d %H:%M",
+                        xaxis=dict(
+                            tickmode='auto',
+                            nticks=20,
+                            tickformat="%Y-%m-%d %H:%M"
+                        ),
+                        showlegend=True
+                    )
+                    st.plotly_chart(fig_timeline, use_container_width=True)
+                else:
+                    st.warning("No valid timeline data available for plotting after datetime conversion")
+                    logger.warning("Timeline data empty after datetime conversion")
+            else:
+                st.warning("No timeline data available for this job")
+                logger.warning("Timeline data is empty")
             
             # Log Level Counts by Class
             if not class_pivot.empty:
