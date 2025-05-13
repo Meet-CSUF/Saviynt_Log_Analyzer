@@ -400,14 +400,25 @@ def get_logs_by_class_and_level(job_id: str, class_name: str, level: str, page: 
     try:
         conn = sqlite3.connect('data/logs.db', timeout=30)
         offset = (page - 1) * logs_per_page
-        query = """
-            SELECT timestamp, log_message, level, class
-            FROM logs
-            WHERE job_id = ? AND class = ? AND level = ?
-        """
-        params = [job_id, class_name, level]
         
-        if search_query:
+        # Base query
+        if level == "ALL":
+            query = """
+                SELECT timestamp, log_message, level, class
+                FROM logs
+                WHERE job_id = ? AND class = ?
+            """
+            params = [job_id, class_name]
+        else:
+            query = """
+                SELECT timestamp, log_message, level, class
+                FROM logs
+                WHERE job_id = ? AND class = ? AND level = ?
+            """
+            params = [job_id, class_name, level]
+        
+        # Add search query if provided
+        if search_query and search_query.strip():
             if use_regex:
                 query += " AND log_message REGEXP ?"
                 params.append(search_query)
@@ -415,18 +426,30 @@ def get_logs_by_class_and_level(job_id: str, class_name: str, level: str, page: 
                 query += " AND log_message LIKE ?"
                 params.append(f'%{search_query}%')
         
-        query += " LIMIT ? OFFSET ?"
+        # Add sorting and pagination
+        query += " ORDER BY timestamp LIMIT ? OFFSET ?"
         params.extend([logs_per_page, offset])
         
+        # Execute query
         logs_df = pd.read_sql_query(query, conn, params=params)
-        count_query = """
-            SELECT COUNT(*) as total
-            FROM logs
-            WHERE job_id = ? AND class = ? AND level = ?
-        """
-        count_params = [job_id, class_name, level]
         
-        if search_query:
+        # Count query
+        if level == "ALL":
+            count_query = """
+                SELECT COUNT(*) as total
+                FROM logs
+                WHERE job_id = ? AND class = ?
+            """
+            count_params = [job_id, class_name]
+        else:
+            count_query = """
+                SELECT COUNT(*) as total
+                FROM logs
+                WHERE job_id = ? AND class = ? AND level = ?
+            """
+            count_params = [job_id, class_name, level]
+        
+        if search_query and search_query.strip():
             if use_regex:
                 count_query += " AND log_message REGEXP ?"
                 count_params.append(search_query)
@@ -461,14 +484,25 @@ def get_logs_by_service_and_level(job_id: str, service_name: str, level: str, pa
     try:
         conn = sqlite3.connect('data/logs.db', timeout=30)
         offset = (page - 1) * logs_per_page
-        query = """
-            SELECT timestamp, log_message, level, service
-            FROM logs
-            WHERE job_id = ? AND service = ? AND level = ?
-        """
-        params = [job_id, service_name, level]
         
-        if search_query:
+        # Base query
+        if level == "ALL":
+            query = """
+                SELECT timestamp, log_message, level, service
+                FROM logs
+                WHERE job_id = ? AND service = ?
+            """
+            params = [job_id, service_name]
+        else:
+            query = """
+                SELECT timestamp, log_message, level, service
+                FROM logs
+                WHERE job_id = ? AND service = ? AND level = ?
+            """
+            params = [job_id, service_name, level]
+        
+        # Add search query if provided
+        if search_query and search_query.strip():
             if use_regex:
                 query += " AND log_message REGEXP ?"
                 params.append(search_query)
@@ -476,18 +510,30 @@ def get_logs_by_service_and_level(job_id: str, service_name: str, level: str, pa
                 query += " AND log_message LIKE ?"
                 params.append(f'%{search_query}%')
         
-        query += " LIMIT ? OFFSET ?"
+        # Add sorting and pagination
+        query += " ORDER BY timestamp LIMIT ? OFFSET ?"
         params.extend([logs_per_page, offset])
         
+        # Execute query
         logs_df = pd.read_sql_query(query, conn, params=params)
-        count_query = """
-            SELECT COUNT(*) as total
-            FROM logs
-            WHERE job_id = ? AND service = ? AND level = ?
-        """
-        count_params = [job_id, service_name, level]
         
-        if search_query:
+        # Count query
+        if level == "ALL":
+            count_query = """
+                SELECT COUNT(*) as total
+                FROM logs
+                WHERE job_id = ? AND service = ?
+            """
+            count_params = [job_id, service_name]
+        else:
+            count_query = """
+                SELECT COUNT(*) as total
+                FROM logs
+                WHERE job_id = ? AND service = ? AND level = ?
+            """
+            count_params = [job_id, service_name, level]
+        
+        if search_query and search_query.strip():
             if use_regex:
                 count_query += " AND log_message REGEXP ?"
                 count_params.append(search_query)
@@ -596,6 +642,36 @@ def resume_analysis(job_id):
         st.session_state.notifications.append({
             'type': 'error',
             'message': f"Error resuming analysis: {str(e)}",
+            'timestamp': time.time()
+        })
+
+@retry(stop_max_attempt_number=3, wait_exponential_multiplier=1000, wait_exponential_max=10000)
+def delete_analysis(job_id):
+    """Delete an analysis job and its associated data via backend API."""
+    if not st.session_state.backend_available:
+        st.session_state.notifications.append({
+            'type': 'error',
+            'message': "Backend server is not running. Please start `python backend.py`.",
+            'timestamp': time.time()
+        })
+        return
+    try:
+        response = requests.post(f"{BACKEND_URL}/jobs/{job_id}/delete", timeout=10)
+        response.raise_for_status()
+        st.session_state.selected_job_id = None
+        st.session_state.show_dashboard = False
+        st.session_state.dashboard_data = None
+        st.session_state.notifications.append({
+            'type': 'success',
+            'message': f"Deleted analysis job: {job_id}",
+            'timestamp': time.time()
+        })
+        logger.info(f"Deleted analysis job: {job_id}")
+    except requests.RequestException as e:
+        logger.error(f"Error deleting analysis: {str(e)}")
+        st.session_state.notifications.append({
+            'type': 'error',
+            'message': f"Error deleting analysis: {str(e)}",
             'timestamp': time.time()
         })
 
@@ -1030,6 +1106,18 @@ def main():
                 if st.button("Download Results", key="download_results"):
                     download_results(st.session_state.selected_job_id)
                 st.markdown('<span class="tooltiptext">Downloads analysis results as an Excel file</span></div>', unsafe_allow_html=True)
+                
+                st.markdown('<div class="tooltip">', unsafe_allow_html=True)
+                if st.button("Delete Analysis", key="delete_analysis"):
+                    if st.session_state.backend_available:
+                        delete_analysis(st.session_state.selected_job_id)
+                    else:
+                        st.session_state.notifications.append({
+                            'type': 'error',
+                            'message': "Cannot delete analysis: Backend server is not running. Please start `python backend.py`.",
+                            'timestamp': time.time()
+                        })
+                st.markdown('<span class="tooltiptext">Deletes the selected analysis job and all associated data</span></div>', unsafe_allow_html=True)
             
             if st.button("Check Backend Status", key="check_backend_status"):
                 check_backend_health()
@@ -1067,9 +1155,9 @@ def main():
                 
                 log_level = st.selectbox(
                     "Select Log Level",
-                    config['app']['log_levels'],
+                    config['app']['log_levels'] + ['ALL'],
                     key="log_level_viewer",
-                    help="Choose a log level to filter logs"
+                    help="Choose a log level to filter logs, or select ALL to view logs across all levels"
                 )
                 col1, col2 = st.columns(2)
                 with col1:
@@ -1095,7 +1183,7 @@ def main():
                 )
                 use_regex = st.checkbox("Use Regex", key="regex_viewer", help="Enable regex for search queries")
                 
-                logs_per_page = 50
+                logs_per_page = 100000
                 page = st.number_input(
                     "Page",
                     min_value=1,
@@ -1106,6 +1194,12 @@ def main():
                     help="Select page for paginated results"
                 )
                 
+                # Log selected class or service for debugging
+                if selected_class != 'None':
+                    logger.debug(f"Selected class: {selected_class} for job_id: {st.session_state.log_viewer_job_id}")
+                if selected_service != 'None':
+                    logger.debug(f"Selected service: {selected_service} for job_id: {st.session_state.log_viewer_job_id}")
+                
                 if st.button("Fetch Logs", key="fetch_logs"):
                     if selected_class == 'None' and selected_service == 'None':
                         st.session_state.notifications.append({
@@ -1113,7 +1207,7 @@ def main():
                             'message': "Please select a class or service",
                             'timestamp': time.time()
                         })
-                    elif log_level not in config['app']['log_levels']:
+                    elif log_level not in config['app']['log_levels'] + ['ALL']:
                         st.session_state.notifications.append({
                             'type': 'error',
                             'message': "Please select a valid log level",
@@ -1153,9 +1247,19 @@ def main():
                                     })
                                 else:
                                     st.info("No logs found for the selected criteria")
+                                    logger.warning(f"No logs found for job_id: {st.session_state.log_viewer_job_id}, "
+                                                  f"class: {selected_class}, service: {selected_service}, level: {log_level}")
+                                    # Clear cache to prevent stale results
+                                    get_logs_by_class_and_level.clear()
+                                    get_logs_by_service_and_level.clear()
                                     st.session_state.log_viewer_logs = []
                                     st.session_state.log_viewer_total_logs = 0
                                     st.session_state.log_viewer_total_pages = 1
+                                    st.session_state.notifications.append({
+                                        'type': 'warning',
+                                        'message': f"No logs found. Cache cleared. Try selecting a different class or service.",
+                                        'timestamp': time.time()
+                                    })
                             except Exception as e:
                                 st.session_state.notifications.append({
                                     'type': 'error',

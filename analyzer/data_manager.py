@@ -5,6 +5,7 @@ import os
 import xlsxwriter
 import streamlit as st
 import time
+from datetime import datetime
 
 # Configure logging
 logging.basicConfig(
@@ -107,6 +108,7 @@ def init_db():
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_logs_level ON logs (level)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_logs_job_id_class_level ON logs (job_id, class, level)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_logs_job_id_service_level ON logs (job_id, service, level)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs (timestamp)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_job_metadata_job_id_type ON job_metadata (job_id, type)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_class_level_counts_job_id ON class_level_counts (job_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_service_level_counts_job_id ON service_level_counts (job_id)')
@@ -164,13 +166,24 @@ def get_logs_by_class_and_level(job_id: str, class_name: str, level: str, page: 
     try:
         conn = sqlite3.connect('data/logs.db', timeout=30)
         offset = (page - 1) * logs_per_page
-        query = """
-            SELECT timestamp, log_message, level, class
-            FROM logs
-            WHERE job_id = ? AND class = ? AND level = ?
-        """
-        params = [job_id, class_name, level]
         
+        # Base query
+        if level == "ALL":
+            query = """
+                SELECT timestamp, log_message, level, class
+                FROM logs
+                WHERE job_id = ? AND class = ?
+            """
+            params = [job_id, class_name]
+        else:
+            query = """
+                SELECT timestamp, log_message, level, class
+                FROM logs
+                WHERE job_id = ? AND class = ? AND level = ?
+            """
+            params = [job_id, class_name, level]
+        
+        # Add search query if provided
         if search_query and search_query.strip():
             if use_regex:
                 query += " AND log_message REGEXP ?"
@@ -179,16 +192,28 @@ def get_logs_by_class_and_level(job_id: str, class_name: str, level: str, page: 
                 query += " AND log_message LIKE ?"
                 params.append(f'%{search_query}%')
         
-        query += " LIMIT ? OFFSET ?"
+        # Add sorting and pagination
+        query += " ORDER BY timestamp LIMIT ? OFFSET ?"
         params.extend([logs_per_page, offset])
         
+        # Execute query
         logs_df = pd.read_sql_query(query, conn, params=params)
-        count_query = """
-            SELECT COUNT(*) as total
-            FROM logs
-            WHERE job_id = ? AND class = ? AND level = ?
-        """
-        count_params = [job_id, class_name, level]
+        
+        # Count query
+        if level == "ALL":
+            count_query = """
+                SELECT COUNT(*) as total
+                FROM logs
+                WHERE job_id = ? AND class = ?
+            """
+            count_params = [job_id, class_name]
+        else:
+            count_query = """
+                SELECT COUNT(*) as total
+                FROM logs
+                WHERE job_id = ? AND class = ? AND level = ?
+            """
+            count_params = [job_id, class_name, level]
         
         if search_query and search_query.strip():
             if use_regex:
@@ -225,13 +250,24 @@ def get_logs_by_service_and_level(job_id: str, service_name: str, level: str, pa
     try:
         conn = sqlite3.connect('data/logs.db', timeout=30)
         offset = (page - 1) * logs_per_page
-        query = """
-            SELECT timestamp, log_message, level, service
-            FROM logs
-            WHERE job_id = ? AND service = ? AND level = ?
-        """
-        params = [job_id, service_name, level]
         
+        # Base query
+        if level == "ALL":
+            query = """
+                SELECT timestamp, log_message, level, service
+                FROM logs
+                WHERE job_id = ? AND service = ?
+            """
+            params = [job_id, service_name]
+        else:
+            query = """
+                SELECT timestamp, log_message, level, service
+                FROM logs
+                WHERE job_id = ? AND service = ? AND level = ?
+            """
+            params = [job_id, service_name, level]
+        
+        # Add search query if provided
         if search_query and search_query.strip():
             if use_regex:
                 query += " AND log_message REGEXP ?"
@@ -240,16 +276,28 @@ def get_logs_by_service_and_level(job_id: str, service_name: str, level: str, pa
                 query += " AND log_message LIKE ?"
                 params.append(f'%{search_query}%')
         
-        query += " LIMIT ? OFFSET ?"
+        # Add sorting and pagination
+        query += " ORDER BY timestamp LIMIT ? OFFSET ?"
         params.extend([logs_per_page, offset])
         
+        # Execute query
         logs_df = pd.read_sql_query(query, conn, params=params)
-        count_query = """
-            SELECT COUNT(*) as total
-            FROM logs
-            WHERE job_id = ? AND service = ? AND level = ?
-        """
-        count_params = [job_id, service_name, level]
+        
+        # Count query
+        if level == "ALL":
+            count_query = """
+                SELECT COUNT(*) as total
+                FROM logs
+                WHERE job_id = ? AND service = ?
+            """
+            count_params = [job_id, service_name]
+        else:
+            count_query = """
+                SELECT COUNT(*) as total
+                FROM logs
+                WHERE job_id = ? AND service = ? AND level = ?
+            """
+            count_params = [job_id, service_name, level]
         
         if search_query and search_query.strip():
             if use_regex:
@@ -373,9 +421,11 @@ def export_to_excel(job_id: str) -> str:
         class_totals = level_counts_by_class.groupby('class')['count'].sum().reset_index()
         service_totals = level_counts_by_service.groupby('service')['count'].sum().reset_index()
         
-        output_dir = 'data/exports'
+        # Create folder with job_id and timestamp
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        output_dir = os.path.join('data', 'exports', f'{job_id}_{timestamp}')
         os.makedirs(output_dir, exist_ok=True)
-        output_file = os.path.join(output_dir, f'analysis_results_{job_id}.xlsx')
+        output_file = os.path.join(output_dir, 'analysis_results.xlsx')
         
         with xlsxwriter.Workbook(output_file) as workbook:
             header_format = workbook.add_format({

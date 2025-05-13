@@ -243,6 +243,13 @@ async def process_log_file(file_path: str, job_id: str, conn: sqlite3.Connection
             
             conn.commit()
         
+        # Log the processed file in the database
+        conn.execute('''
+            INSERT INTO job_metadata (job_id, type, value)
+            VALUES (?, ?, ?)
+        ''', (job_id, 'processed_file', file_path))
+        conn.commit()
+        
         logger.info(f"Processed log file: {file_path} for job_id: {job_id}, "
                    f"missing or invalid class formats: {missing_class_count}, "
                    f"invalid timestamps: {invalid_timestamp_count}")
@@ -251,7 +258,7 @@ async def process_log_file(file_path: str, job_id: str, conn: sqlite3.Connection
         raise
 
 async def process_job(job_id: str, folder_path: str):
-    """Process all log files in the specified folder."""
+    """Process all log files in the specified folder, resuming from last processed file."""
     try:
         conn = sqlite3.connect('data/logs.db', timeout=60)
         conn.execute('PRAGMA journal_mode=WAL')
@@ -293,17 +300,30 @@ async def process_job(job_id: str, folder_path: str):
             conn.close()
             return
         
+        # Get already processed files
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT value FROM job_metadata WHERE job_id = ? AND type = 'processed_file'
+        ''', (job_id,))
+        processed_files = set(row[0] for row in cursor.fetchall())
+        files_processed = len(processed_files)
+        logger.info(f"Job {job_id} resuming with {files_processed}/{total_files} files already processed")
+        
         # Update job metadata
         conn.execute('''
             UPDATE jobs SET status = ?, total_files = ?, files_processed = ?, last_updated = ?
             WHERE job_id = ?
-        ''', ('RUNNING', total_files, 0, datetime.now().strftime('%Y-%m-%d %H:%M:%S'), job_id))
+        ''', ('RUNNING', total_files, files_processed, datetime.now().strftime('%Y-%m-%d %H:%M:%S'), job_id))
         conn.commit()
         job_states[job_id]['total_files'] = total_files
-        job_states[job_id]['files_processed'] = 0
+        job_states[job_id]['files_processed'] = files_processed
         
-        # Process each file
-        for file_path in log_files:
+        # Process remaining files
+        for idx, file_path in enumerate(log_files):
+            if file_path in processed_files:
+                logger.debug(f"Skipping already processed file: {file_path}")
+                continue
+            
             if job_states[job_id]['status'] == 'PAUSED':
                 logger.info(f"Job {job_id} paused at file {file_path}")
                 conn.execute('''
@@ -399,8 +419,8 @@ async def health_check():
 async def start_job(request: StartJobRequest):
     """Start a new log analysis job."""
     global job_states
-    job_id = str(uuid.uuid4())
     start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    job_id = request.folder_path.split("/")[-1] + "_" + start_time
     
     job_states[job_id] = {
         'job_id': job_id,
@@ -448,6 +468,26 @@ async def get_job_status(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
     logger.debug(f"Retrieved status for job: {job_id}")
     return job_states[job_id]
+
+@app.get("/jobs/{job_id}/processed_files")
+async def get_processed_files(job_id: str):
+    """Get list of processed files for a specific job."""
+    if job_id not in job_states:
+        logger.error(f"Job not found: {job_id}")
+        raise HTTPException(status_code=404, detail="Job not found")
+    try:
+        conn = sqlite3.connect('data/logs.db', timeout=60)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT value FROM job_metadata WHERE job_id = ? AND type = 'processed_file'
+        ''', (job_id,))
+        processed_files = [row[0] for row in cursor.fetchall()]
+        conn.close()
+        logger.debug(f"Retrieved {len(processed_files)} processed files for job: {job_id}")
+        return {"job_id": job_id, "processed_files": processed_files}
+    except Exception as e:
+        logger.error(f"Error retrieving processed files for job {job_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error retrieving processed files: {str(e)}")
 
 @app.post("/jobs/{job_id}/pause")
 async def pause_job(job_id: str):
@@ -502,12 +542,52 @@ async def resume_job(job_id: str):
         conn.close()
         
         asyncio.create_task(process_job(job_id, job_states[job_id]['folder_path']))
-        logger.info(f"Resumed job: {job_id}")
+        logger.info(f"Resumed job: {job_id} from {job_states[job_id]['files_processed']} files processed")
         return {"status": "Job resumed"}
     except Exception as e:
         logger.error(f"Error resuming job {job_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error resuming job: {str(e)}")
+
+@app.post("/jobs/{job_id}/delete")
+async def delete_job(job_id: str):
+    """Delete a job and all its associated data from the database."""
+    if job_id not in job_states:
+        logger.error(f"Job not found: {job_id}")
+        raise HTTPException(status_code=404, detail="Job not found")
     
+    try:
+        conn = sqlite3.connect('data/logs.db', timeout=60)
+        conn.execute('PRAGMA journal_mode=WAL')
+        cursor = conn.cursor()
+        
+        # Begin transaction
+        cursor.execute('BEGIN TRANSACTION')
+        
+        # Delete from all relevant tables
+        cursor.execute('DELETE FROM jobs WHERE job_id = ?', (job_id,))
+        cursor.execute('DELETE FROM logs WHERE job_id = ?', (job_id,))
+        cursor.execute('DELETE FROM job_metadata WHERE job_id = ?', (job_id,))
+        cursor.execute('DELETE FROM class_level_counts WHERE job_id = ?', (job_id,))
+        cursor.execute('DELETE FROM service_level_counts WHERE job_id = ?', (job_id,))
+        cursor.execute('DELETE FROM timeline_counts WHERE job_id = ?', (job_id,))
+        cursor.execute('DELETE FROM class_service_counts WHERE job_id = ?', (job_id,))
+        
+        # Commit transaction
+        conn.commit()
+        
+        # Remove from job_states
+        del job_states[job_id]
+        
+        conn.close()
+        logger.info(f"Deleted job {job_id} and all associated data")
+        return {"status": "Job deleted successfully"}
+    except Exception as e:
+        # Rollback transaction on error
+        conn.rollback()
+        conn.close()
+        logger.error(f"Error deleting job {job_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error deleting job: {str(e)}")
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
