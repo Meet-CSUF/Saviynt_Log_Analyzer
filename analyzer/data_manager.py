@@ -1,228 +1,436 @@
+import sqlite3
 import pandas as pd
-import os
-import json
 import logging
-from io import BytesIO
-import openpyxl
-import glob
-from datetime import datetime
+import os
+import xlsxwriter
+import streamlit as st
+import time
 
+# Configure logging
+logging.basicConfig(
+    filename='log_analyzer.log',
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-class DataManager:
-    def __init__(self, config):
-        """Initialize data manager with configuration."""
-        self.config = config
-        self.data_dir = config['paths']['data_dir']
-        self.state_dir = config['paths']['state_dir']
-        os.makedirs(self.data_dir, exist_ok=True)
-        os.makedirs(self.state_dir, exist_ok=True)
-        self.level_counts_by_class_file = os.path.join(self.data_dir, 'level_counts_by_class.csv')
-        self.level_counts_by_service_file = os.path.join(self.data_dir, 'level_counts_by_service.csv')
-        self.timeline_file = os.path.join(self.data_dir, 'timeline_data.csv')
-        self.class_service_file = os.path.join(self.data_dir, 'class_service_counts.csv')
+def init_db():
+    """Initialize SQLite database with jobs, logs, metadata, and summary tables."""
+    try:
+        os.makedirs('data', exist_ok=True)
+        conn = sqlite3.connect('data/logs.db', timeout=30)
+        cursor = conn.cursor()
+        
+        # Jobs table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS jobs (
+                job_id TEXT PRIMARY KEY,
+                folder_path TEXT,
+                status TEXT,
+                files_processed INTEGER,
+                total_files INTEGER,
+                start_time TEXT,
+                last_updated TEXT,
+                current_file TEXT
+            )
+        ''')
+        
+        # Logs table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT,
+                timestamp TEXT,
+                level TEXT,
+                class TEXT,
+                service TEXT,
+                log_message TEXT,
+                folder TEXT,
+                file_name TEXT,
+                line_idx INTEGER,
+                FOREIGN KEY (job_id) REFERENCES jobs (job_id)
+            )
+        ''')
+        
+        # Job metadata table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS job_metadata (
+                job_id TEXT,
+                type TEXT,
+                value TEXT,
+                UNIQUE(job_id, type, value)
+            )
+        ''')
+        
+        # Summary tables
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS class_level_counts (
+                job_id TEXT,
+                class TEXT,
+                level TEXT,
+                count INTEGER,
+                PRIMARY KEY (job_id, class, level)
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS service_level_counts (
+                job_id TEXT,
+                service TEXT,
+                level TEXT,
+                count INTEGER,
+                PRIMARY KEY (job_id, service, level)
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS timeline_counts (
+                job_id TEXT,
+                hour TEXT,
+                level TEXT,
+                count INTEGER,
+                PRIMARY KEY (job_id, hour, level)
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS class_service_counts (
+                job_id TEXT,
+                class TEXT,
+                service TEXT,
+                count INTEGER,
+                PRIMARY KEY (job_id, class, service)
+            )
+        ''')
+        
+        # Indexes
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_logs_job_id ON logs (job_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_logs_class ON logs (class)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_logs_service ON logs (service)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_logs_level ON logs (level)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_logs_job_id_class_level ON logs (job_id, class, level)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_logs_job_id_service_level ON logs (job_id, service, level)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_job_metadata_job_id_type ON job_metadata (job_id, type)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_class_level_counts_job_id ON class_level_counts (job_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_service_level_counts_job_id ON service_level_counts (job_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_timeline_counts_job_id ON timeline_counts (job_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_class_service_counts_job_id ON class_service_counts (job_id)')
+        
+        conn.commit()
+        conn.close()
+        logger.info("Database initialized with tables and indexes")
+    except sqlite3.OperationalError as e:
+        logger.error(f"Database initialization error: {str(e)}")
+        raise
+    except Exception as e:
+        logger.error(f"Error initializing database: {str(e)}")
+        raise
 
-    def clear_data(self):
-        """Clear all processed data files for a fresh run."""
-        try:
-            csv_files = glob.glob(os.path.join(self.data_dir, '*.csv'))
-            for file in csv_files:
-                os.remove(file)
-                logger.info(f"Deleted data file: {file}")
-            state_files = glob.glob(os.path.join(self.state_dir, '*.json'))
-            for file in state_files:
-                os.remove(file)
-                logger.info(f"Deleted state file: {file}")
-        except Exception as e:
-            logger.error(f"Error clearing data: {str(e)}")
-            raise
+@st.cache_data
+def get_job_metadata(job_id: str):
+    """Fetch unique classes and services for a job from job_metadata table, cached."""
+    try:
+        conn = sqlite3.connect('data/logs.db', timeout=30)
+        classes = pd.read_sql_query(
+            "SELECT value FROM job_metadata WHERE job_id = ? AND type = 'class'",
+            conn,
+            params=[job_id]
+        )['value'].dropna().unique().tolist()
+        services = pd.read_sql_query(
+            "SELECT value FROM job_metadata WHERE job_id = ? AND type = 'service'",
+            conn,
+            params=[job_id]
+        )['value'].dropna().unique().tolist()
+        conn.close()
+        logger.info(f"Fetched metadata for job_id: {job_id}, classes: {len(classes)}, services: {len(services)}")
+        return classes, services
+    except sqlite3.OperationalError as e:
+        logger.error(f"Database error fetching metadata for job_id {job_id}: {str(e)}")
+        st.session_state.notifications.append({
+            'type': 'error',
+            'message': f"Database error fetching metadata: {str(e)}",
+            'timestamp': time.time()
+        })
+        return [], []
+    except Exception as e:
+        logger.error(f"Error fetching metadata for job_id {job_id}: {str(e)}")
+        st.session_state.notifications.append({
+            'type': 'error',
+            'message': f"Error fetching metadata: {str(e)}",
+            'timestamp': time.time()
+        })
+        return [], []
 
-    def save_data(self, level_counts_by_class, level_counts_by_service, timeline_data, class_service_counts):
-        """Save analysis data to CSV files."""
-        try:
-            level_counts_by_class.to_csv(self.level_counts_by_class_file, index=False)
-            level_counts_by_service.to_csv(self.level_counts_by_service_file, index=False)
-            timeline_data.to_csv(self.timeline_file, index=False)
-            class_service_counts.to_csv(self.class_service_file, index=False)
-            logger.info("Saved analysis data to CSV files")
-        except Exception as e:
-            logger.error(f"Error saving data: {str(e)}")
-            raise
+@st.cache_data
+def get_logs_by_class_and_level(job_id: str, class_name: str, level: str, page: int, logs_per_page: int, search_query: str = None, use_regex: bool = False):
+    """Retrieve logs by class and level from SQLite, cached."""
+    try:
+        conn = sqlite3.connect('data/logs.db', timeout=30)
+        offset = (page - 1) * logs_per_page
+        query = """
+            SELECT timestamp, log_message, level, class
+            FROM logs
+            WHERE job_id = ? AND class = ? AND level = ?
+        """
+        params = [job_id, class_name, level]
+        
+        if search_query and search_query.strip():
+            if use_regex:
+                query += " AND log_message REGEXP ?"
+                params.append(search_query)
+            else:
+                query += " AND log_message LIKE ?"
+                params.append(f'%{search_query}%')
+        
+        query += " LIMIT ? OFFSET ?"
+        params.extend([logs_per_page, offset])
+        
+        logs_df = pd.read_sql_query(query, conn, params=params)
+        count_query = """
+            SELECT COUNT(*) as total
+            FROM logs
+            WHERE job_id = ? AND class = ? AND level = ?
+        """
+        count_params = [job_id, class_name, level]
+        
+        if search_query and search_query.strip():
+            if use_regex:
+                count_query += " AND log_message REGEXP ?"
+                count_params.append(search_query)
+            else:
+                count_query += " AND log_message LIKE ?"
+                count_params.append(f'%{search_query}%')
+        
+        total_logs = pd.read_sql_query(count_query, conn, params=count_params)['total'].iloc[0]
+        conn.close()
+        logger.debug(f"Fetched {len(logs_df)} logs, total_logs={total_logs}, page={page}")
+        return logs_df.to_dict('records'), total_logs
+    except sqlite3.OperationalError as e:
+        logger.error(f"Database error fetching logs by class and level: {str(e)}")
+        st.session_state.notifications.append({
+            'type': 'error',
+            'message': f"Database error: {str(e)}",
+            'timestamp': time.time()
+        })
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching logs by class and level: {str(e)}")
+        st.session_state.notifications.append({
+            'type': 'error',
+            'message': f"Error fetching logs: {str(e)}",
+            'timestamp': time.time()
+        })
+        raise
 
-    def load_raw_level_counts_by_class(self):
-        """Load raw level counts by class from CSV."""
-        try:
-            if os.path.exists(self.level_counts_by_class_file):
-                df = pd.read_csv(self.level_counts_by_class_file)
-                df = df.astype({'count': 'int64'})
-                logger.debug(f"Loaded raw level_counts_by_class: shape={df.shape}")
-                return df
-            logger.debug("No level_counts_by_class CSV found")
-            return pd.DataFrame(columns=['class', 'level', 'count']).astype({'count': 'int64'})
-        except Exception as e:
-            logger.error(f"Error loading raw level_counts_by_class: {str(e)}")
-            raise
+@st.cache_data
+def get_logs_by_service_and_level(job_id: str, service_name: str, level: str, page: int, logs_per_page: int, search_query: str = None, use_regex: bool = False):
+    """Retrieve logs by service and level from SQLite, cached."""
+    try:
+        conn = sqlite3.connect('data/logs.db', timeout=30)
+        offset = (page - 1) * logs_per_page
+        query = """
+            SELECT timestamp, log_message, level, service
+            FROM logs
+            WHERE job_id = ? AND service = ? AND level = ?
+        """
+        params = [job_id, service_name, level]
+        
+        if search_query and search_query.strip():
+            if use_regex:
+                query += " AND log_message REGEXP ?"
+                params.append(search_query)
+            else:
+                query += " AND log_message LIKE ?"
+                params.append(f'%{search_query}%')
+        
+        query += " LIMIT ? OFFSET ?"
+        params.extend([logs_per_page, offset])
+        
+        logs_df = pd.read_sql_query(query, conn, params=params)
+        count_query = """
+            SELECT COUNT(*) as total
+            FROM logs
+            WHERE job_id = ? AND service = ? AND level = ?
+        """
+        count_params = [job_id, service_name, level]
+        
+        if search_query and search_query.strip():
+            if use_regex:
+                count_query += " AND log_message REGEXP ?"
+                count_params.append(search_query)
+            else:
+                count_query += " AND log_message LIKE ?"
+                count_params.append(f'%{search_query}%')
+        
+        total_logs = pd.read_sql_query(count_query, conn, params=count_params)['total'].iloc[0]
+        conn.close()
+        logger.debug(f"Fetched {len(logs_df)} logs, total_logs={total_logs}, page={page}")
+        return logs_df.to_dict('records'), total_logs
+    except sqlite3.OperationalError as e:
+        logger.error(f"Database error fetching logs by service and level: {str(e)}")
+        st.session_state.notifications.append({
+            'type': 'error',
+            'message': f"Database error: {str(e)}",
+            'timestamp': time.time()
+        })
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching logs by service and level: {str(e)}")
+        st.session_state.notifications.append({
+            'type': 'error',
+            'message': f"Error fetching logs: {str(e)}",
+            'timestamp': time.time()
+        })
+        raise
 
-    def load_raw_level_counts_by_service(self):
-        """Load raw level counts by service from CSV."""
-        try:
-            if os.path.exists(self.level_counts_by_service_file):
-                df = pd.read_csv(self.level_counts_by_service_file)
-                df = df.astype({'count': 'int64'})
-                logger.debug(f"Loaded raw level_counts_by_service: shape={df.shape}")
-                return df
-            logger.debug("No level_counts_by_service CSV found")
-            return pd.DataFrame(columns=['service', 'level', 'count']).astype({'count': 'int64'})
-        except Exception as e:
-            logger.error(f"Error loading raw level_counts_by_service: {str(e)}")
-            raise
+@st.cache_data
+def _fetch_analysis_data(job_id: str, query_type: str) -> pd.DataFrame:
+    """Fetch analysis data for a specific query type from summary tables."""
+    try:
+        conn = sqlite3.connect('data/logs.db', timeout=30)
+        
+        if query_type == 'class':
+            df = pd.read_sql_query("""
+                SELECT class, level, count
+                FROM class_level_counts
+                WHERE job_id = ?
+            """, conn, params=[job_id])
+        
+        elif query_type == 'service':
+            df = pd.read_sql_query("""
+                SELECT service, level, count
+                FROM service_level_counts
+                WHERE job_id = ?
+            """, conn, params=[job_id])
+        
+        elif query_type == 'timeline':
+            df = pd.read_sql_query("""
+                SELECT hour, level, count
+                FROM timeline_counts
+                WHERE job_id = ?
+            """, conn, params=[job_id])
+        
+        elif query_type == 'class_service':
+            df = pd.read_sql_query("""
+                SELECT class, service, count
+                FROM class_service_counts
+                WHERE job_id = ?
+            """, conn, params=[job_id])
+        
+        else:
+            raise ValueError(f"Invalid query_type: {query_type}")
+        
+        conn.close()
+        
+        if df.empty:
+            if query_type == 'class':
+                df = pd.DataFrame(columns=['class', 'level', 'count'])
+            elif query_type == 'service':
+                df = pd.DataFrame(columns=['service', 'level', 'count'])
+            elif query_type == 'timeline':
+                df = pd.DataFrame(columns=['hour', 'level', 'count'])
+            elif query_type == 'class_service':
+                df = pd.DataFrame(columns=['class', 'service', 'count'])
+        
+        logger.info(f"Retrieved {query_type} data for job_id: {job_id}")
+        return df
+    
+    except sqlite3.OperationalError as e:
+        logger.error(f"Database error retrieving {query_type} data for job_id {job_id}: {str(e)}")
+        return pd.DataFrame()
+    except Exception as e:
+        logger.error(f"Error retrieving {query_type} data for job_id {job_id}: {str(e)}")
+        return pd.DataFrame()
 
-    def load_raw_timeline_data(self):
-        """Load raw timeline data from CSV."""
-        try:
-            if os.path.exists(self.timeline_file):
-                df = pd.read_csv(self.timeline_file)
-                df['timestamp'] = pd.to_datetime(df['timestamp'])
-                df = df.astype({'count': 'int64'})
-                logger.debug(f"Loaded raw timeline_data: shape={df.shape}")
-                return df
-            logger.debug("No timeline_data CSV found")
-            return pd.DataFrame(columns=['timestamp', 'level', 'count']).astype({'count': 'int64'})
-        except Exception as e:
-            logger.error(f"Error loading raw timeline_data: {str(e)}")
-            raise
+def get_analysis_data(job_id: str, query_type: str) -> pd.DataFrame:
+    """Retrieve analysis data for a job."""
+    return _fetch_analysis_data(job_id, query_type)
 
-    def load_raw_class_service_counts(self):
-        """Load raw class/service counts from CSV."""
-        try:
-            if os.path.exists(self.class_service_file):
-                df = pd.read_csv(self.class_service_file)
-                df = df.astype({'count': 'int64'})
-                logger.debug(f"Loaded raw class_service_counts: shape={df.shape}")
-                return df
-            logger.debug("No class_service_counts CSV found")
-            return pd.DataFrame(columns=['class', 'service', 'count']).astype({'count': 'int64'})
-        except Exception as e:
-            logger.error(f"Error loading raw class_service_counts: {str(e)}")
-            raise
-
-    def get_level_counts_by_class(self):
-        """Get aggregated log level counts by class."""
-        try:
-            if os.path.exists(self.level_counts_by_class_file):
-                df = pd.read_csv(self.level_counts_by_class_file)
-                pivot = pd.pivot_table(
-                    df,
-                    values='count',
-                    index='class',
-                    columns='level',
-                    aggfunc='sum',
-                    fill_value=0
-                ).reset_index()
-                logger.debug(f"Level counts by class: {pivot.shape}")
-                return pivot
-            logger.debug("No level counts by class data available")
-            return pd.DataFrame(columns=['class'] + self.config['app']['log_levels'])
-        except Exception as e:
-            logger.error(f"Error getting level counts by class: {str(e)}")
-            raise
-
-    def get_level_counts_by_service(self):
-        """Get aggregated log level counts by service."""
-        try:
-            if os.path.exists(self.level_counts_by_service_file):
-                df = pd.read_csv(self.level_counts_by_service_file)
-                pivot = pd.pivot_table(
-                    df,
-                    values='count',
-                    index='service',
-                    columns='level',
-                    aggfunc='sum',
-                    fill_value=0
-                ).reset_index()
-                logger.debug(f"Level counts by service: {pivot.shape}")
-                return pivot
-            logger.debug("No level counts by service data available")
-            return pd.DataFrame(columns=['service'] + self.config['app']['log_levels'])
-        except Exception as e:
-            logger.error(f"Error getting level counts by service: {str(e)}")
-            raise
-
-    def get_timeline_data(self):
-        """Get timeline data for log levels."""
-        try:
-            if os.path.exists(self.timeline_file):
-                df = pd.read_csv(self.timeline_file)
-                df['timestamp'] = pd.to_datetime(df['timestamp'])
-                aggregated = df.groupby(['timestamp', 'level']).sum().reset_index()
-                logger.debug(f"Timeline data: {aggregated.shape}")
-                return aggregated
-            logger.debug("No timeline data available")
-            return pd.DataFrame(columns=['timestamp', 'level', 'count'])
-        except Exception as e:
-            logger.error(f"Error getting timeline data: {str(e)}")
-            raise
-
-    def get_class_service_counts(self):
-        """Get total counts per class and service."""
-        try:
-            if os.path.exists(self.class_service_file):
-                df = pd.read_csv(self.class_service_file)
-                aggregated = df.groupby(['class', 'service']).sum().reset_index()
-                logger.debug(f"Class/Service counts: {aggregated.shape}")
-                return aggregated
-            logger.debug("No class/service counts available")
-            return pd.DataFrame(columns=['class', 'service', 'count'])
-        except Exception as e:
-            logger.error(f"Error getting class/service counts: {str(e)}")
-            raise
-
-    def save_state(self, state, log_folder):
-        """Save analysis state with folder_path_datetime naming."""
-        try:
-            # Create filename: replace '/' with '_' in folder path and append datetime
-            folder_part = log_folder.replace('/', '_').replace('\\', '_')
-            dt_part = datetime.now().strftime('%Y%m%d%H%M%S')
-            state_filename = f"{folder_part}_{dt_part}.json"
-            state_path = os.path.join(self.state_dir, state_filename)
-            with open(state_path, 'w') as f:
-                json.dump(state, f)
-            logger.info(f"Saved state to {state_path}")
-            # Clean up old states (keep only latest 10)
-            state_files = sorted(glob.glob(os.path.join(self.state_dir, '*.json')), key=os.path.getmtime, reverse=True)
-            for old_file in state_files[10:]:
-                os.remove(old_file)
-                logger.info(f"Deleted old state file: {old_file}")
-        except Exception as e:
-            logger.error(f"Error saving state: {str(e)}")
-            raise
-
-    def load_state(self, state_file):
-        """Load analysis state from a specific file."""
-        try:
-            if os.path.exists(state_file):
-                with open(state_file, 'r') as f:
-                    state = json.load(f)
-                    logger.info(f"Loaded state from {state_file}")
-                    return state
-            logger.debug(f"State file {state_file} not found")
-            return None
-        except Exception as e:
-            logger.error(f"Error loading state from {state_file}: {str(e)}")
-            raise
-
-    def create_excel(self):
-        """Create an Excel file with multiple sheets for analysis results."""
-        try:
-            buffer = BytesIO()
-            with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                self.get_level_counts_by_class().to_excel(writer, sheet_name='Level_Counts_by_Class', index=False)
-                self.get_level_counts_by_service().to_excel(writer, sheet_name='Level_Counts_by_Service', index=False)
-                self.get_timeline_data().to_excel(writer, sheet_name='Timeline_Data', index=False)
-                self.get_class_service_counts().to_excel(writer, sheet_name='Class_Service_Counts', index=False)
-            buffer.seek(0)
-            logger.info("Created Excel file for download")
-            return buffer
-        except Exception as e:
-            logger.error(f"Error creating Excel file: {str(e)}")
-            raise
+def export_to_excel(job_id: str) -> str:
+    """Export analysis data to Excel file."""
+    try:
+        level_counts_by_class = get_analysis_data(job_id=job_id, query_type='class')
+        level_counts_by_service = get_analysis_data(job_id=job_id, query_type='service')
+        timeline_data = get_analysis_data(job_id=job_id, query_type='timeline')
+        
+        # Pivot class data
+        if not level_counts_by_class.empty:
+            class_pivot = level_counts_by_class.pivot(index='class', columns='level', values='count').fillna(0)
+            class_pivot = class_pivot.reset_index()
+        else:
+            class_pivot = pd.DataFrame(columns=['class'])
+        
+        # Pivot service data
+        if not level_counts_by_service.empty:
+            service_pivot = level_counts_by_service.pivot(index='service', columns='level', values='count').fillna(0)
+            service_pivot = service_pivot.reset_index()
+        else:
+            service_pivot = pd.DataFrame(columns=['service'])
+        
+        # Calculate total counts for class and service
+        class_totals = level_counts_by_class.groupby('class')['count'].sum().reset_index()
+        service_totals = level_counts_by_service.groupby('service')['count'].sum().reset_index()
+        
+        output_dir = 'data/exports'
+        os.makedirs(output_dir, exist_ok=True)
+        output_file = os.path.join(output_dir, f'analysis_results_{job_id}.xlsx')
+        
+        with xlsxwriter.Workbook(output_file) as workbook:
+            header_format = workbook.add_format({
+                'bold': True,
+                'bg_color': '#12133f',
+                'font_color': '#FFFFFF',
+                'border': 1
+            })
+            cell_format = workbook.add_format({'border': 1})
+            
+            # Class Level Counts
+            worksheet1 = workbook.add_worksheet('Class Level Counts')
+            headers1 = ['Class'] + list(class_pivot.columns[1:])
+            for col, header in enumerate(headers1):
+                worksheet1.write(0, col, header, header_format)
+            for row, data in enumerate(class_pivot.to_dict('records'), 1):
+                worksheet1.write(row, 0, data['class'], cell_format)
+                for col, level in enumerate(class_pivot.columns[1:], 1):
+                    worksheet1.write(row, col, data.get(level, 0), cell_format)
+            
+            # Service Level Counts
+            worksheet2 = workbook.add_worksheet('Service Level Counts')
+            headers2 = ['Service'] + list(service_pivot.columns[1:])
+            for col, header in enumerate(headers2):
+                worksheet2.write(0, col, header, header_format)
+            for row, data in enumerate(service_pivot.to_dict('records'), 1):
+                worksheet2.write(row, 0, data['service'], cell_format)
+                for col, level in enumerate(service_pivot.columns[1:], 1):
+                    worksheet2.write(row, col, data.get(level, 0), cell_format)
+            
+            # Timeline Data
+            worksheet3 = workbook.add_worksheet('Timeline Data')
+            headers3 = ['Hour', 'Level', 'Count']
+            for col, header in enumerate(headers3):
+                worksheet3.write(0, col, header, header_format)
+            for row, data in enumerate(timeline_data.to_dict('records'), 1):
+                worksheet3.write(row, 0, data['hour'], cell_format)
+                worksheet3.write(row, 1, data['level'], cell_format)
+                worksheet3.write(row, 2, data['count'], cell_format)
+            
+            # Class Totals
+            worksheet4 = workbook.add_worksheet('Class Totals')
+            headers4 = ['Class', 'Count']
+            for col, header in enumerate(headers4):
+                worksheet4.write(0, col, header, header_format)
+            for row, data in enumerate(class_totals.to_dict('records'), 1):
+                worksheet4.write(row, 0, data['class'], cell_format)
+                worksheet4.write(row, 1, data['count'], cell_format)
+            
+            # Service Totals
+            worksheet5 = workbook.add_worksheet('Service Totals')
+            headers5 = ['Service', 'Count']
+            for col, header in enumerate(headers5):
+                worksheet5.write(0, col, header, header_format)
+            for row, data in enumerate(service_totals.to_dict('records'), 1):
+                worksheet5.write(row, 0, data['service'], cell_format)
+                worksheet5.write(row, 1, data['count'], cell_format)
+        
+        logger.info(f"Exported analysis data to {output_file} for job_id: {job_id}")
+        return output_file
+    except Exception as e:
+        logger.error(f"Error exporting to Excel for job_id {job_id}: {str(e)}")
+        raise

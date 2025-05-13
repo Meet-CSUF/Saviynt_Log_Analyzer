@@ -1,19 +1,16 @@
 import streamlit as st
-import os
+import pandas as pd
+import requests
 import yaml
 import logging
-import re
-from analyzer.log_processor import LogProcessor
-from analyzer.data_manager import DataManager
-from analyzer.visualizer import Visualizer
-import pandas as pd
-from datetime import datetime
 import time
-import sys
-import glob
-
-# Increase recursion limit
-sys.setrecursionlimit(3000)
+import json
+import sqlite3
+from datetime import datetime
+from analyzer.visualizer import Visualizer
+from analyzer.data_manager import export_to_excel, get_analysis_data, init_db
+from retrying import retry
+import os
 
 # Configure logging
 logging.basicConfig(
@@ -23,786 +20,1184 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Load configuration
-with open('config/config.yaml', 'r') as f:
-    config = yaml.safe_load(f)
+# Backend API base URL
+BACKEND_URL = "http://localhost:8000"
 
-def update_log_folder():
-    """Callback to update st.session_state.log_folder when text input changes."""
-    new_value = st.session_state.log_folder_input
-    logger.debug(f"update_log_folder called, new_value: {new_value}")
-    st.session_state.log_folder = new_value
+def load_config():
+    """Load configuration from YAML file."""
+    try:
+        with open('config/config.yaml', 'r') as file:
+            return yaml.safe_load(file)
+    except FileNotFoundError:
+        logger.error("Config file config/config.yaml not found")
+        st.error("Configuration file not found. Please create config/config.yaml.")
+        return {'app': {'log_levels': [], 'data_dir': 'data', 'state_dir': 'data'}}
+    except Exception as e:
+        logger.error(f"Error loading config: {str(e)}")
+        st.error(f"Error loading config: {str(e)}")
+        return {'app': {'log_levels': []}}
 
-def get_available_states():
-    """Get list of saved state files sorted by datetime (newest first)."""
-    state_dir = config['paths']['state_dir']
-    state_files = glob.glob(os.path.join(state_dir, '*.json'))
-    state_info = []
-    for file in state_files:
-        try:
-            file_name = os.path.basename(file)
-            parts = file_name.rsplit('_', 1)
-            if len(parts) == 2:
-                folder_path = parts[0].replace('_', '/')
-                dt = datetime.strptime(parts[1].replace('.json', ''), '%Y%m%d%H%M%S')
-                state_info.append((file, folder_path, dt))
-        except Exception as e:
-            logger.warning(f"Invalid state file name {file}: {str(e)}")
-    state_info.sort(key=lambda x: x[2], reverse=True)
-    return state_info
-
-def render_full_ui():
-    """Render the entire UI within a single container for log analysis."""
-    with st.container():
-        st.markdown('<div class="main-content">', unsafe_allow_html=True)
-
-        # Notifications
-        for notification in st.session_state.notifications:
-            if notification['type'] == 'success':
-                st.success(notification['message'])
-            elif notification['type'] == 'error':
-                st.error(notification['message'])
-            elif notification['type'] == 'warning':
-                st.warning(notification['message'])
-        st.session_state.notifications = [
-            n for n in st.session_state.notifications
-            if time.time() - n['timestamp'] < 5
-        ]
-
-        # Progress
-        progress = st.session_state.files_processed / max(st.session_state.total_files, 1) if st.session_state.total_files > 0 else 0
-        st.progress(min(progress, 1.0))
-
-        # Status
-        status_text = (
-            f"Processing file {st.session_state.files_processed}/{st.session_state.total_files}"
-            if st.session_state.app_state == 'RUNNING'
-            else "Analysis completed" if st.session_state.files_processed == st.session_state.total_files and st.session_state.files_processed > 0
-            else f"Processed {st.session_state.files_processed}/{st.session_state.total_files} files"
-        )
-        st.markdown(f'<p class="status-message">{status_text}</p>', unsafe_allow_html=True)
-
-        # Dashboard
-        if not all(df.empty for df in st.session_state.dashboard_data.values()):
-            st.session_state.visualizer.display_dashboard(
-                st.session_state.dashboard_data['level_counts_by_class'],
-                st.session_state.dashboard_data['level_counts_by_service'],
-                st.session_state.dashboard_data['timeline_data'],
-                st.session_state.dashboard_data['class_service_counts'],
-                log_processor=st.session_state.processor
-            )
-
-        # Footer
-        days_processed = len(set(folder.split('-')[0] for folder in st.session_state.folders_processed)) if st.session_state.folders_processed else 0
-        hours_processed = len(st.session_state.folders_processed) if st.session_state.folders_processed else 0
-        eta_text = "N/A"
-        if st.session_state.files_processed > 0 and st.session_state.average_file_time:
-            remaining_files = st.session_state.files_remaining
-            eta_seconds = remaining_files * st.session_state.average_file_time
-            if eta_seconds < 60:
-                eta_text = f"{int(eta_seconds)} seconds"
-            elif eta_seconds < 3600:
-                eta_text = f"{int(eta_seconds // 60)} minutes"
-            else:
-                eta_text = f"{int(eta_seconds // 3600)} hours {int((eta_seconds % 3600) // 60)} minutes"
-        st.markdown(f"""
-        <div class="footer">
-        <div class="counter">
-            <span>{st.session_state.total_lines_processed}</span>
-            <p>Lines Processed</p>
-        </div>
-        <div class="counter">
-            <span>{st.session_state.files_processed}</span>
-            <p>Files Processed</p>
-        </div>
-        <div class="counter">
-            <span>{st.session_state.files_remaining}</span>
-            <p>Files Remaining</p>
-        </div>
-        <div class="counter">
-            <span>{hours_processed}</span>
-            <p>Hours Processed</p>
-        </div>
-        <div class="counter">
-            <span>{days_processed}</span>
-            <p>Days Processed</p>
-        </div>
-        <div class="counter">
-            <span>{st.session_state.current_folder or 'None'}</span>
-            <p>Current Folder</p>
-        </div>
-        <div class="counter">
-            <span>{st.session_state.current_file or 'None'}</span>
-            <p>Current File</p>
-        </div>
-        <div class="counter">
-            <span>{eta_text}</span>
-            <p>Est. Time to Complete</p>
-        </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        st.markdown('</div>', unsafe_allow_html=True)
-
-def main():
-    st.set_page_config(page_title="Saviynt Log Analyzer", page_icon="static/saviynt_favicon.ico", layout="wide")
-
-    # Custom CSS
-    st.markdown("""
-    <style>
-    @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@600&family=Inter:wght@400;500&display=swap');
-    @import url('https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css');
-
-    /* Global styles */
-    .main {
-        background: #f0ede6;
-        color: #1A1A1A;
-        font-family: 'Inter', sans-serif;
-        min-height: 100vh;
-        padding-bottom: 80px;
-    }
-    h1, h2, h3 {
-        font-family: 'Poppins', sans-serif;
-        color: #12133f;
-    }
-
-    /* Header */
-    .header {
-        display: flex;
-        align-items: center;
-        justify-content: flex-start;
-        background: linear-gradient(90deg, #12133f, #2A2B5A);
-        padding: 0 15px;
-        height: 80px;
-        border-bottom: 1px solid #D1D5DB;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        margin-bottom: 20px;
-    }
-    .header img {
-        width: 50px;
-        height: 50px;
-        margin: 5px;
-        border-radius: 8px;
-        object-fit: cover;
-    }
-    .header .logo-placeholder {
-        width: 50px;
-        height: 50px;
-        background: #12133f;
-        margin: 5px;
-        border-radius: 8px;
-    }
-    .header h1 {
-        margin: 0;
-        padding: 0;
-        color: #FFFFFF;
-        font-size: 1.6em;
-        line-height: 1;
-    }
-
-    /* Sidebar */
-    .css-1d391kg {
-        background: #EDEFF5;
-        padding: 20px;
-        width: 300px !important;
-        border-right: 1px solid #D1D5DB;
-        box-shadow: 2px 0 4px rgba(0,0,0,0.1);
-    }
-    .css-1d391kg h2 {
-        color: #12133f;
-        font-size: 1.5em;
-        text-align: center;
-        margin-bottom: 20px;
-    }
-    .stButton>button {
-        background: #12133f;
-        color: #FFFFFF;
-        border: none;
-        border-radius: 8px;
-        padding: 10px;
-        width: 100%;
-        font-size: 1em;
-        font-family: 'Inter', sans-serif;
-        transition: transform 0.2s, background 0.2s;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-    }
-    .stButton>button:hover {
-        transform: scale(1.05);
-        background: #2A2B5A;
-    }
-    .stButton>button:hover .button-icon {
-        color: #FFFFFF;
-    }
-    .button-container {
-        display: flex;
-        align-items: center;
-        margin-bottom: 10px;
-    }
-    .button-icon {
-        margin-right: 8px;
-        font-size: 1em;
-        color: #12133f;
-    }
-    .stTextInput>label {
-        color: #1A1A1A;
-        font-size: 1em;
-        font-weight: 500;
-    }
-    .stTextInput>div>input {
-        background: #f0ede6;
-        color: #1A1A1A;
-        border: 1px solid #D1D5DB;
-        border-radius: 8px;
-        padding: 8px;
-    }
-    .stSelectbox>label {
-        color: #1A1A1A;
-        font-size: 1em;
-        font-weight: 500;
-    }
-    .stSelectbox>div>select {
-        background: #f0ede6;
-        color: #1A1A1A;
-        border: 1px solid #D1D5DB;
-        border-radius: 8px;
-        padding: 8px;
-    }
-
-    /* Main content */
-    .main-content {
-        max-width: 1200px;
-        margin: 0 auto;
-        padding: 20px;
-    }
-
-    /* Cards for plots */
-    .card {
-        background: #f0ede6;
-        border-radius: 8px;
-        padding: 15px;
-        margin-bottom: 20px;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-    }
-    .stPlotlyChart, .stDataFrame {
-        background: #f0ede6;
-        border-radius: 8px;
-        overflow: hidden;
-    }
-    .stDataFrame table {
-        width: 100%;
-        border-collapse: collapse;
-        background: #f0ede6;
-    }
-    .stDataFrame th {
-        position: sticky;
-        top: 0;
-        background: #F7F9FC;
-        color: #1A1A1A;
-        z-index: 10;
-    }
-
-    /* Expander */
-    .stExpander {
-        border: 1px solid #D1D5DB;
-        border-radius: 8px;
-    }
-    .stExpander summary {
-        background: #F7F9FC;
-        color: #12133f;
-        font-weight: 500;
-    }
-
-    /* Footer counters */
-    .footer {
-        position: fixed;
-        bottom: 0;
-        left: 0;
-        right: 0;
-        background: #F7F9FC;
-        padding: 10px 20px;
-        display: flex;
-        justify-content: space-around;
-        border-top: 1px solid #D1D5DB;
-        box-shadow: 0 -2px 4px rgba(0,0,0,0.1);
-        z-index: 1000;
-        height: 60px;
-        align-items: center;
-    }
-    .counter {
-        text-align: center;
-        color: #12133f;
-    }
-    .counter span {
-        font-size: 1em;
-        color: #12133f;
-        font-weight: bold;
-        transition: all 0.5s ease-in-out;
-        margin: 5px 0;
-    }
-    .counter p {
-        font-size: 0.7em;
-        color: #12133f;
-        margin: 5px 0;
-    }
-
-    /* Progress bar */
-    .stProgress .st-bo {
-        background: #12133f;
-    }
-    .progress-container p {
-        font-size: 1em;
-        color: #12133f;
-        margin-top: 5px;
-        text-align: center;
-    }
-    .progress-container span {
-        font-weight: 500;
-        transition: all 0.5s ease-in-out;
-    }
-
-    /* Alerts */
-    .stAlert {
-        background: #FFF5F5;
-        border: 1px solid #F56565;
-        border-radius: 8px;
-        color: #1A1A1A;
-        margin-bottom: 10px;
-        padding: 10px;
-    }
-
-    /* Status message */
-    .status-message {
-        font-size: 1em;
-        color: #12133f;
-        text-align: center;
-        margin: 10px 0;
-    }
-
-    /* File uploader */
-    .stFileUploader>label {
-        color: #1A1A1A;
-        font-size: 1em;
-        font-weight: 500;
-    }
-    .stFileUploader>div {
-        background: #f0ede6;
-        border: 1px solid #D1D5DB;
-        border-radius: 8px;
-        padding: 8px;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-
-    # Header with logo
-    logo_path = os.path.join('public', 'logo.png')
-    if os.path.exists(logo_path):
-        st.markdown(f'<div class="header"><img src="/public/logo.png" alt="Logo"><h1>Saviynt Log Analyzer</h1></div>', unsafe_allow_html=True)
-    else:
-        st.markdown("""
-        <div class="header">
-        <h1>Saviynt Log Analyzer</h1>
-        </div>
-        """, unsafe_allow_html=True)
-        logger.warning("Logo file 'public/logo.png' not found. Using placeholder.")
-
-    # Initialize session state
-    if 'app_state' not in st.session_state:
-        st.session_state.app_state = 'IDLE'
-        st.session_state.processor = None
-        st.session_state.data_manager = DataManager(config)
-        st.session_state.visualizer = Visualizer(config)
-        st.session_state.current_file = None
-        st.session_state.current_line = 0
-        st.session_state.total_lines_processed = 0
-        st.session_state.files_processed = 0
-        st.session_state.files_remaining = 0
-        st.session_state.total_files = 0
-        st.session_state.folders_processed = set()
-        st.session_state.current_folder = None
-        st.session_state.last_update_time = time.time()
-        st.session_state.update_interval = config['app'].get('update_interval', 30)
-        st.session_state.dashboard_data = {
-            'level_counts_by_class': pd.DataFrame(),
-            'level_counts_by_service': pd.DataFrame(),
-            'timeline_data': pd.DataFrame(),
-            'class_service_counts': pd.DataFrame()
-        }
+def initialize_session_state():
+    """Initialize Streamlit session state variables."""
+    if 'selected_job_id' not in st.session_state:
+        st.session_state.selected_job_id = None
+    if 'dashboard_data' not in st.session_state:
+        st.session_state.dashboard_data = None
+    if 'notifications' not in st.session_state:
         st.session_state.notifications = []
-        st.session_state.log_folder = ''
-        st.session_state.logs_to_display_class = []
-        st.session_state.logs_to_display_service = []
-        st.session_state.total_logs_class = 0
-        st.session_state.total_logs_service = 0
-        st.session_state.log_page = 1
-        st.session_state.selected_index = None
-        st.session_state.selected_level = None
-        st.session_state.average_file_time = 0
-        st.session_state.uploaded_csv_data = {}  # New state for uploaded CSV data
+    if 'csv_notifications' not in st.session_state:
+        st.session_state.csv_notifications = []
+    if 'backend_available' not in st.session_state:
+        st.session_state.backend_available = False
+    if 'db_initialized' not in st.session_state:
+        st.session_state.db_initialized = False
+    if 'log_viewer_job_id' not in st.session_state:
+        st.session_state.log_viewer_job_id = None
+    if 'cached_job_id' not in st.session_state:
+        st.session_state.cached_job_id = None
+    if 'show_dashboard' not in st.session_state:
+        st.session_state.show_dashboard = False
+    if 'last_notification_clear' not in st.session_state:
+        st.session_state.last_notification_clear = time.time()
+    if 'log_viewer_current_page' not in st.session_state:
+        st.session_state.log_viewer_current_page = 1
+    if 'log_viewer_total_pages' not in st.session_state:
+        st.session_state.log_viewer_total_pages = 1
+    if 'log_viewer_logs' not in st.session_state:
+        st.session_state.log_viewer_logs = []
+    if 'log_viewer_total_logs' not in st.session_state:
+        st.session_state.log_viewer_total_logs = 0
+    if 'log_viewer_last_job_id' not in st.session_state:
+        st.session_state.log_viewer_last_job_id = None
 
-    # Create tabs for Log Analysis and CSV Visualization
-    tab1, tab2 = st.tabs(["Log Analysis", "CSV Visualization"])
-
-    with tab1:
-        # Sidebar controls for Log Analysis
-        with st.sidebar:
-            st.markdown("<h2>Analysis Controls</h2>", unsafe_allow_html=True)
-            log_folder = st.text_input(
-                "Log Folder Path",
-                value=st.session_state.get('log_folder', ''),
-                placeholder="e.g., /data/customer_logs",
-                key="log_folder_input",
-                on_change=update_log_folder
-            )
-            logger.debug(f"Log folder input after rendering: {log_folder}")
-
-            state_info = get_available_states()
-            state_options = [f"{folder_path} ({dt.strftime('%Y-%m-%d %H:%M:%S')})" for _, folder_path, dt in state_info]
-            state_options.insert(0, "Select a state (default: latest)")
-            selected_state = st.selectbox(
-                "Select Saved State",
-                options=state_options,
-                key="state_select"
-            )
-
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown('<div class="button-container"><i class="fas fa-play button-icon"></i>Start Analysis</div>', unsafe_allow_html=True)
-                start_btn = st.button("Start Analysis", key="start_btn")
-            with col2:
-                st.markdown('<div class="button-container"><i class="fas fa-pause button-icon"></i>Pause Analysis</div>', unsafe_allow_html=True)
-                pause_btn = st.button("Pause Analysis", key="pause_btn")
-
-            st.markdown('<div class="button-container"><i class="fas fa-download button-icon"></i>Download Results</div>', unsafe_allow_html=True)
-            download_btn = st.button("Download Results", key="download_btn")
-
-            st.markdown('<div class="button-container"><i class="fas fa-forward button-icon"></i>Resume Analysis</div>', unsafe_allow_html=True)
-            resume_btn = st.button("Resume Analysis", key="resume_btn")
-
-        # Handle button actions
-        if start_btn:
-            logger.debug(f"Start Analysis clicked, log_folder: {st.session_state.log_folder}, current_state: {st.session_state.app_state}")
-            if st.session_state.app_state == 'RUNNING':
-                st.session_state.notifications.append({'type': 'warning', 'message': "Analysis is already running.", 'timestamp': time.time()})
-                logger.warning("Start Analysis clicked while already RUNNING")
-            elif not st.session_state.log_folder:
-                st.session_state.notifications.append({'type': 'error', 'message': "Please enter a log folder path.", 'timestamp': time.time()})
-                logger.warning("Start Analysis clicked without log folder path")
-            elif not os.path.exists(st.session_state.log_folder):
-                st.session_state.notifications.append({'type': 'error', 'message': "Log folder does not exist.", 'timestamp': time.time()})
-                logger.error(f"Log folder does not exist: {st.session_state.log_folder}")
-            elif not os.path.isdir(st.session_state.log_folder):
-                st.session_state.notifications.append({'type': 'error', 'message': "Path is not a directory.", 'timestamp': time.time()})
-                logger.error(f"Path is not a directory: {st.session_state.log_folder}")
-            else:
-                try:
-                    all_files = []
-                    for dirpath, dirnames, filenames in os.walk(st.session_state.log_folder):
-                        logger.debug(f"Found folder: {dirpath}, subfolders: {dirnames}, files: {filenames}")
-                        all_files.extend(os.path.join(dirpath, f) for f in filenames)
-                    gz_files = [f for f in all_files if f.endswith('.gz')]
-                    logger.debug(f"All files: {all_files}")
-                    logger.debug(f"Filtered .gz files: {gz_files}")
-
-                    if not gz_files:
-                        st.session_state.notifications.append({'type': 'error', 'message': "No .gz files found in the specified folder.", 'timestamp': time.time()})
-                        logger.error(f"No .gz files found in: {st.session_state.log_folder}")
-                        st.session_state.app_state = 'IDLE'
-                    else:
-                        st.session_state.data_manager.clear_data()
-                        if os.path.exists('data/state'):
-                            for f in os.listdir('data/state'):
-                                os.remove(os.path.join('data/state', f))
-                                logger.debug(f"Cleared stale state file: {f}")
-                        st.session_state.data_manager = DataManager(config)
-                        logger.debug(f"Initializing LogProcessor with log_folder: {st.session_state.log_folder}, config: {config}")
-                        st.session_state.processor = LogProcessor(st.session_state.log_folder, config, st.session_state.data_manager)
-                        st.session_state.app_state = 'RUNNING'
-                        st.session_state.last_update_time = time.time()
-                        st.session_state.total_lines_processed = 0
-                        st.session_state.files_processed = 0
-                        st.session_state.total_files = st.session_state.processor.get_total_files()
-                        st.session_state.files_remaining = st.session_state.total_files
-                        st.session_state.folders_processed = set()
-                        st.session_state.current_folder = None
-                        st.session_state.average_file_time = 0
-                        st.session_state.dashboard_data = {
-                            'level_counts_by_class': pd.DataFrame(),
-                            'level_counts_by_service': pd.DataFrame(),
-                            'timeline_data': pd.DataFrame(),
-                            'class_service_counts': pd.DataFrame()
-                        }
-                        st.session_state.logs_to_display_class = []
-                        st.session_state.logs_to_display_service = []
-                        st.session_state.total_logs_class = 0
-                        st.session_state.total_logs_service = 0
-                        st.session_state.log_page = 1
-                        st.session_state.selected_index = None
-                        st.session_state.selected_level = None
-                        st.session_state.pop('search_query_class', None)
-                        st.session_state.pop('search_query_service', None)
-                        logger.debug(f"Started analysis, total_files: {st.session_state.total_files}, log_folder: {st.session_state.log_folder}, expected gz_files: {gz_files}")
-                        st.session_state.notifications.append({'type': 'success', 'message': f"Started fresh analysis for folder: {st.session_state.log_folder}", 'timestamp': time.time()})
-                        logger.info(f"Started fresh analysis for folder: {st.session_state.log_folder}")
-                except Exception as e:
-                    st.session_state.notifications.append({'type': 'error', 'message': f"Error starting analysis: {str(e)}", 'timestamp': time.time()})
-                    logger.error(f"Error starting analysis: {str(e)}")
-                    st.session_state.app_state = 'IDLE'
-
-        if pause_btn:
-            logger.debug(f"Pause Analysis clicked, current_state: {st.session_state.app_state}")
-            if st.session_state.app_state != 'RUNNING':
-                st.session_state.notifications.append({'type': 'warning', 'message': "No analysis is running to pause.", 'timestamp': time.time()})
-                logger.warning("Pause Analysis clicked when not RUNNING")
-            elif not st.session_state.processor:
-                st.session_state.notifications.append({'type': 'warning', 'message': "No analysis is running to pause.", 'timestamp': time.time()})
-                logger.warning("Pause Analysis clicked with no active processor")
-            else:
-                try:
-                    st.session_state.processor.save_state()
-                    st.session_state.app_state = 'PAUSED'
-                    st.session_state.notifications.append({'type': 'success', 'message': "Analysis paused and state saved", 'timestamp': time.time()})
-                    logger.info("Analysis paused")
-                    st.session_state.logs_to_display_class = []
-                    st.session_state.logs_to_display_service = []
-                    st.session_state.total_logs_class = 0
-                    st.session_state.total_logs_service = 0
-                    st.session_state.log_page = 1
-                    st.session_state.selected_index = None
-                    st.session_state.selected_level = None
-                    st.session_state.pop('search_query_class', None)
-                    st.session_state.pop('search_query_service', None)
-                except Exception as e:
-                    st.session_state.notifications.append({'type': 'error', 'message': f"Error pausing analysis: {str(e)}", 'timestamp': time.time()})
-                    logger.error(f"Error pausing analysis: {str(e)}")
-                    st.session_state.app_state = 'IDLE'
-
-        if resume_btn:
-            logger.debug(f"Resume Analysis clicked, current_state: {st.session_state.app_state}")
-            try:
-                state_info = get_available_states()
-                if not state_info:
-                    st.session_state.notifications.append({'type': 'warning', 'message': "No saved states found. Please start a fresh analysis.", 'timestamp': time.time()})
-                    logger.warning("No saved states found for resume")
-                else:
-                    selected_state_file = None
-                    if selected_state != "Select a state (default: latest)":
-                        selected_idx = state_options.index(selected_state) - 1
-                        selected_state_file = state_info[selected_idx][0]
-                    else:
-                        selected_state_file = state_info[0][0]
-
-                    state = st.session_state.data_manager.load_state(selected_state_file)
-                    if not state or not os.path.exists(state.get('log_folder', '')):
-                        st.session_state.notifications.append({'type': 'warning', 'message': "Selected state is invalid or log folder does not exist.", 'timestamp': time.time()})
-                        logger.warning(f"Invalid state or missing log folder in state: {selected_state_file}")
-                    else:
-                        logger.debug(f"Resuming with state: {selected_state_file}, log_folder: {state['log_folder']}")
-                        st.session_state.processor = LogProcessor(
-                            state['log_folder'],
-                            config,
-                            st.session_state.data_manager,
-                            state
-                        )
-                        st.session_state.log_folder = state['log_folder']
-                        st.session_state.last_update_time = time.time()
-                        st.session_state.total_lines_processed = state.get('total_lines_processed', 0)
-                        st.session_state.files_processed = state.get('files_processed', 0)
-                        st.session_state.total_files = st.session_state.processor.get_total_files()
-                        st.session_state.files_remaining = st.session_state.processor.get_remaining_files()
-                        st.session_state.folders_processed = set(state.get('folders_processed', []))
-                        st.session_state.average_file_time = state.get('average_file_time', 0)
-                        st.session_state.dashboard_data = {
-                            'level_counts_by_class': st.session_state.data_manager.get_level_counts_by_class(),
-                            'level_counts_by_service': st.session_state.data_manager.get_level_counts_by_service(),
-                            'timeline_data': st.session_state.data_manager.get_timeline_data(),
-                            'class_service_counts': st.session_state.data_manager.get_class_service_counts()
-                        }
-                        st.session_state.app_state = 'RUNNING'
-                        st.session_state.logs_to_display_class = []
-                        st.session_state.logs_to_display_service = []
-                        st.session_state.total_logs_class = 0
-                        st.session_state.total_logs_service = 0
-                        st.session_state.log_page = 1
-                        st.session_state.selected_index = None
-                        st.session_state.selected_level = None
-                        st.session_state.pop('search_query_class', None)
-                        st.session_state.pop('search_query_service', None)
-                        logger.debug(f"Resumed analysis, total_files: {st.session_state.total_files}, files_remaining: {st.session_state.files_remaining}, log_folder: {state['log_folder']}")
-                        st.session_state.notifications.append({'type': 'success', 'message': f"Resumed analysis from state: {os.path.basename(selected_state_file)}", 'timestamp': time.time()})
-                        logger.info(f"Resumed analysis from state: {selected_state_file}")
-            except Exception as e:
-                st.session_state.notifications.append({'type': 'error', 'message': f"Error resuming analysis: {str(e)}", 'timestamp': time.time()})
-                logger.error(f"Error resuming analysis: {str(e)}")
-                st.session_state.app_state = 'IDLE'
-
-        if download_btn:
-            logger.debug(f"Download Results clicked, current_state: {st.session_state.app_state}")
-            try:
-                if os.path.exists(st.session_state.data_manager.level_counts_by_class_file):
-                    excel_buffer = st.session_state.data_manager.create_excel()
-                    st.download_button(
-                        label="Download Excel",
-                        data=excel_buffer,
-                        file_name=f"log_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
-                    st.session_state.notifications.append({'type': 'success', 'message': "Results ready for download.", 'timestamp': time.time()})
-                    logger.info("Downloaded analysis results")
-                else:
-                    st.session_state.notifications.append({'type': 'warning', 'message': "No analysis data available to download.", 'timestamp': time.time()})
-                    logger.warning("Download Results clicked with no data")
-            except Exception as e:
-                st.session_state.notifications.append({'type': 'error', 'message': f"Error creating download: {str(e)}", 'timestamp': time.time()})
-                logger.error(f"Error creating download: {str(e)}")
-
-        # Analysis loop
-        if st.session_state.app_state == 'RUNNING' and st.session_state.processor:
-            try:
-                batch_size = 5
-                files_processed_in_batch = 0
-                processed = True
-
-                while st.session_state.app_state == 'RUNNING' and processed and files_processed_in_batch < batch_size:
-                    processed = st.session_state.processor.process_next_file()
-                    logger.debug(f"process_next_file returned: {processed}, files_processed: {st.session_state.files_processed}, total_files: {st.session_state.total_files}, current_folder_idx: {st.session_state.processor.current_folder_idx if st.session_state.processor else -1}, current_file: {st.session_state.processor.current_file if st.session_state.processor else 'None'}")
-                    if processed:
-                        st.session_state.files_processed += 1
-                        st.session_state.files_remaining = st.session_state.processor.get_remaining_files()
-                        st.session_state.total_lines_processed = st.session_state.processor.total_lines_processed
-                        st.session_state.current_folder = st.session_state.processor.folders[st.session_state.processor.current_folder_idx] if st.session_state.processor.current_folder_idx < len(st.session_state.processor.folders) else None
-                        st.session_state.current_file = st.session_state.processor.current_file
-                        if st.session_state.current_folder:
-                            st.session_state.folders_processed.add(st.session_state.current_folder)
-                        files_processed_in_batch += 1
-                        if st.session_state.processor.last_file_time:
-                            total_time = st.session_state.average_file_time * (st.session_state.files_processed - 1) + st.session_state.processor.last_file_time
-                            st.session_state.average_file_time = total_time / st.session_state.files_processed
-                            logger.debug(f"Processed file: {st.session_state.current_file}, lines: {st.session_state.total_lines_processed}, avg_file_time: {st.session_state.average_file_time:.2f}s")
-
-                if files_processed_in_batch >= batch_size or time.time() - st.session_state.last_update_time >= st.session_state.update_interval or not processed:
-                    st.session_state.data_manager.save_data(
-                        st.session_state.processor.level_counts_by_class,
-                        st.session_state.processor.level_counts_by_service,
-                        st.session_state.processor.timeline_data,
-                        st.session_state.processor.class_service_counts
-                    )
-                    st.session_state.dashboard_data = {
-                        'level_counts_by_class': st.session_state.data_manager.get_level_counts_by_class(),
-                        'level_counts_by_service': st.session_state.data_manager.get_level_counts_by_service(),
-                        'timeline_data': st.session_state.data_manager.get_timeline_data(),
-                        'class_service_counts': st.session_state.data_manager.get_class_service_counts()
-                    }
-                    with st.container():
-                        render_full_ui()
-                    st.session_state.last_update_time = time.time()
-                    files_processed_in_batch = 0
-                    logger.info("Updated UI with new data")
-
-                if not processed:
-                    st.session_state.app_state = 'IDLE'
-                    st.session_state.data_manager.save_data(
-                        st.session_state.processor.level_counts_by_class,
-                        st.session_state.processor.level_counts_by_service,
-                        st.session_state.processor.timeline_data,
-                        st.session_state.processor.class_service_counts
-                    )
-                    st.session_state.dashboard_data = {
-                        'level_counts_by_class': st.session_state.data_manager.get_level_counts_by_class(),
-                        'level_counts_by_service': st.session_state.data_manager.get_level_counts_by_service(),
-                        'timeline_data': st.session_state.data_manager.get_timeline_data(),
-                        'class_service_counts': st.session_state.data_manager.get_class_service_counts()
-                    }
-                    with st.container():
-                        render_full_ui()
-                    if st.session_state.files_processed > 0:
-                        st.session_state.notifications.append({'type': 'success', 'message': "Analysis completed", 'timestamp': time.time()})
-                        logger.info("Analysis completed")
-                    else:
-                        st.session_state.notifications.append({'type': 'warning', 'message': "Analysis stopped: No files processed. Check log files or LogProcessor.", 'timestamp': time.time()})
-                        logger.warning("Analysis stopped: No files processed")
-
-            except Exception as e:
-                st.session_state.notifications.append({'type': 'error', 'message': f"Error during analysis: {str(e)}", 'timestamp': time.time()})
-                logger.error(f"Error during analysis: {str(e)}")
-                st.session_state.app_state = 'IDLE'
-
-        # Display UI if not running
-        if st.session_state.app_state != 'RUNNING':
-            with st.container():
-                render_full_ui()
-
-    with tab2:
-        st.header("CSV Visualization")
-        st.markdown("Upload the CSV files generated by the log analysis script to visualize the data.")
+@retry(stop_max_attempt_number=3, wait_exponential_multiplier=1000, wait_exponential_max=10000)
+def check_backend_health():
+    """Check if backend is running and fetch job status."""
+    try:
+        logger.debug(f"Attempting health check to {BACKEND_URL}/health")
+        response = requests.get(f"{BACKEND_URL}/health", timeout=10)
+        response.raise_for_status()
+        st.session_state.backend_available = True
+        logger.info("Backend health check passed")
         
-        # File uploader for multiple CSV files
-        uploaded_files = st.file_uploader(
-            "Upload CSV Files",
-            type=["csv"],
-            accept_multiple_files=True,
-            key="csv_uploader"
-        )
-
-        if uploaded_files:
+        if st.session_state.selected_job_id:
+            # Verify job_id exists in jobs table
             try:
-                # Clear previous data
-                st.session_state.uploaded_csv_data = {}
+                conn = sqlite3.connect('data/logs.db', timeout=30)
+                cursor = conn.cursor()
+                cursor.execute("SELECT job_id FROM jobs WHERE job_id = ?", (st.session_state.selected_job_id,))
+                job_exists = cursor.fetchone()
+                conn.close()
                 
-                # Expected analysis names
-                expected_analyses = [
-                    'class_level_counts',
-                    'level_summary',
-                    'class_summary',
-                    'pod_summary',
-                    'container_summary',
-                    'host_summary',
-                    'class_level_pod',
-                    'hourly_level_counts',
-                    'thread_summary',
-                    'error_analysis',
-                    'time_range'
-                ]
-                
-                # Process each uploaded file
-                for uploaded_file in uploaded_files:
-                    file_name = uploaded_file.name
-                    # Extract analysis name by removing timestamp suffix (e.g., time_range_20241010_120000.csv -> time_range)
-                    match = re.match(r'^(.+?)_\d{8}_\d{6}\.csv$', file_name)
-                    if match:
-                        analysis_name = match.group(1)
-                        if analysis_name in expected_analyses:
-                            df = pd.read_csv(uploaded_file)
-                            st.session_state.uploaded_csv_data[analysis_name] = df
-                            logger.debug(f"Loaded CSV: {file_name}, analysis: {analysis_name}, shape: {df.shape}, columns: {df.columns.tolist()}")
-                        else:
-                            logger.warning(f"Ignored CSV with unrecognized analysis name: {file_name}")
-                    else:
-                        logger.warning(f"Ignored CSV with invalid filename format: {file_name}")
-
-                if st.session_state.uploaded_csv_data:
-                    loaded_analyses = list(st.session_state.uploaded_csv_data.keys())
-                    st.session_state.notifications.append({
-                        'type': 'success',
-                        'message': f"Successfully loaded {len(loaded_analyses)} CSV files: {', '.join(loaded_analyses)}.",
-                        'timestamp': time.time()
-                    })
-                    # Display the CSV visualization dashboard
-                    st.session_state.visualizer.display_csv_dashboard(st.session_state.uploaded_csv_data)
-                else:
+                if not job_exists:
+                    logger.warning(f"Selected job_id {st.session_state.selected_job_id} not found in database")
                     st.session_state.notifications.append({
                         'type': 'warning',
-                        'message': "No valid CSV files uploaded. Ensure filenames match expected patterns (e.g., time_range_YYYYMMDD_HHMMSS.csv).",
+                        'message': f"Selected job {st.session_state.selected_job_id} no longer exists. Please select a valid job.",
                         'timestamp': time.time()
                     })
-            except Exception as e:
+                    st.session_state.selected_job_id = None
+                    st.session_state.show_dashboard = False
+                    return True
+            except sqlite3.OperationalError as e:
+                logger.error(f"Database error checking job_id {st.session_state.selected_job_id}: {str(e)}")
                 st.session_state.notifications.append({
                     'type': 'error',
-                    'message': f"Error processing CSV files: {str(e)}",
+                    'message': f"Database error checking job status: {str(e)}",
                     'timestamp': time.time()
                 })
-                logger.error(f"Error processing CSV files: {str(e)}")
+                return True
+            
+            # Fetch job status
+            try:
+                job_response = requests.get(f"{BACKEND_URL}/jobs/{st.session_state.selected_job_id}/status", timeout=10)
+                job_response.raise_for_status()
+                job_data = job_response.json()
+                files_processed = job_data.get('files_processed', 0)
+                total_files = job_data.get('total_files', 0)
+                logger.info(f"Backend status for job {st.session_state.selected_job_id}: {files_processed}/{total_files} files processed")
+                st.session_state.notifications.append({
+                    'type': 'success',
+                    'message': f"Backend is healthy! Job {st.session_state.selected_job_id}: {files_processed}/{total_files} files processed.",
+                    'timestamp': time.time()
+                })
+            except requests.RequestException as e:
+                logger.warning(f"Failed to fetch job status: {str(e)}")
+                st.session_state.notifications.append({
+                    'type': 'warning',
+                    'message': f"Backend is healthy, but failed to fetch job status: {str(e)}",
+                    'timestamp': time.time()
+                })
+        else:
+            st.session_state.notifications.append({
+                'type': 'success',
+                'message': "Backend is healthy! No job selected.",
+                'timestamp': time.time()
+            })
+        return True
+    except requests.RequestException as e:
+        logger.warning(f"Backend health check failed: {str(e)}")
+        st.session_state.backend_available = False
+        st.session_state.notifications.append({
+            'type': 'error',
+            'message': "Backend is not responding. Job control actions are unavailable.",
+            'timestamp': time.time()
+        })
+        return False
+
+def apply_custom_css():
+    """Apply Tailwind CSS with glassmorphism."""
+    st.markdown(
+        """
+        <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+        <style>
+        body {
+            background: linear-gradient(to bottom, #f0ede6, #e5e2db);
+            font-family: 'Inter', sans-serif;
+            color: #1F2937;
+        }
+        .header {
+            background: linear-gradient(90deg, #12133f, #2A2B5A);
+            color: #FFFFFF;
+            padding: 3rem 2rem;
+            border-radius: 16px;
+            text-align: center;
+            margin-bottom: 2rem;
+            box-shadow: 0 8px 16px rgba(0, 0, 0, 0.2);
+            position: relative;
+            overflow: hidden;
+        }
+        .header::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: radial-gradient(circle, rgba(255,255,255,0.1) 0%, transparent 70%);
+            animation: pulse 4s infinite;
+        }
+        .header h1 {
+            font-size: 3rem;
+            font-weight: 700;
+            margin: 0;
+            text-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+        }
+        .header p {
+            font-size: 1.25rem;
+            opacity: 0.9;
+        }
+        .card {
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(10px);
+            border-radius: 16px;
+            padding: 2rem;
+            margin-bottom: 1.5rem;
+            box-shadow: 0 8px 16px rgba(0, 0, 0, 0.1);
+            border: 1px solid rgba(209, 213, 219, 0.3);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+        .card:hover {
+            transform: translateY(-8px);
+            box-shadow: 0 12px 24px rgba(0, 0, 0, 0.15);
+        }
+        .stButton>button {
+            background: linear-gradient(90deg, #12133f, #2A2B5A);
+            color: #FFFFFF;
+            border: none;
+            border-radius: 12px;
+            padding: 0.75rem 2rem;
+            font-size: 1.1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s, background 0.3s, box-shadow 0.3s;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+        }
+        .stButton>button:hover {
+            background: linear-gradient(90deg, #2A2B5A, #12133f);
+            transform: scale(1.05);
+            box-shadow: 0 6px 12px rgba(0, 0, 0, 0.3);
+        }
+        .sidebar .stButton>button {
+            width: 100%;
+            margin-bottom: 1rem;
+        }
+        .stTextInput>div>input {
+            border-radius: 12px;
+            border: 1px solid #D1D5DB;
+            padding: 0.75rem;
+            background: rgba(255, 255, 255, 0.9);
+            transition: border-color 0.2s, box-shadow 0.2s;
+        }
+        .stTextInput>div>input:focus {
+            border-color: #12133f;
+            box-shadow: 0 0 0 3px rgba(18, 19, 63, 0.1);
+        }
+        .stSelectbox>div>select {
+            border-radius: 12px;
+            border: 1px solid #D1D5DB;
+            padding: 0.75rem;
+            background: rgba(255, 255, 255, 0.9);
+        }
+        .notification-success {
+            background: rgba(209, 250, 229, 0.95);
+            color: #065F46;
+            padding: 1rem;
+            border-radius: 12px;
+            margin-bottom: 1rem;
+            border: 1px solid #34D399;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            animation: slideIn 0.3s ease;
+        }
+        .notification-error {
+            background: rgba(254, 226, 226, 0.95);
+            color: #991B1B;
+            padding: 1rem;
+            border-radius: 12px;
+            margin-bottom: 1rem;
+            border: 1px solid #F87171;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            animation: slideIn 0.3s ease;
+        }
+        .notification-warning {
+            background: rgba(254, 243, 199, 0.95);
+            color: #92400E;
+            padding: 1rem;
+            border-radius: 12px;
+            margin-bottom: 1rem;
+            border: 1px solid #FBBF24;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            animation: slideIn 0.3s ease;
+        }
+        .sidebar-content {
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(10px);
+            border-radius: 16px;
+            padding: 2rem;
+            box-shadow: 0 8px 16px rgba(0, 0, 0, 0.1);
+            border: 1px solid rgba(209, 213, 219, 0.3);
+        }
+        .tab-content {
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(10px);
+            border-radius: 16px;
+            padding: 2.5rem;
+            box-shadow: 0 8px 16px rgba(0, 0, 0, 0.1);
+            border: 1px solid rgba(209, 213, 219, 0.3);
+        }
+        .tooltip {
+            position: relative;
+            display: inline-block;
+        }
+        .tooltip .tooltiptext {
+            visibility: hidden;
+            width: 200px;
+            background: #2A2B5A;
+            color: #FFFFFF;
+            text-align: center;
+            border-radius: 8px;
+            padding: 0.75rem;
+            position: absolute;
+            z-index: 1;
+            bottom: 125%;
+            left: 50%;
+            margin-left: -100px;
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+        .tooltip:hover .tooltiptext {
+            visibility: visible;
+            opacity: 1;
+        }
+        @keyframes slideIn {
+            from { transform: translateX(-20px); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+        @keyframes pulse {
+            0% { transform: scale(1); opacity: 0.5; }
+            50% { transform: scale(1.2); opacity: 0.3; }
+            100% { transform: scale(1); opacity: 0.5; }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+
+@retry(stop_max_attempt_number=3, wait_exponential_multiplier=1000, wait_exponential_max=10000)
+def get_job_status():
+    """Fetch all job statuses from SQLite database."""
+    try:
+        conn = sqlite3.connect('data/logs.db', timeout=30)
+        query = """
+            SELECT job_id, folder_path, status, files_processed, total_files, start_time, last_updated
+            FROM jobs
+        """
+        df = pd.read_sql_query(query, conn)
+        conn.close()
+        return df
+    except sqlite3.OperationalError as e:
+        logger.error(f"Database error fetching job status: {str(e)}")
+        st.session_state.notifications.append({
+            'type': 'error',
+            'message': f"Database error fetching job status: {str(e)}",
+            'timestamp': time.time()
+        })
+        return pd.DataFrame()
+    except Exception as e:
+        logger.error(f"Error fetching job status: {str(e)}")
+        st.session_state.notifications.append({
+            'type': 'error',
+            'message': f"Error fetching job status: {str(e)}",
+            'timestamp': time.time()
+        })
+        return pd.DataFrame()
+
+@st.cache_data
+def get_job_metadata(job_id: str):
+    """Fetch unique classes and services for a job from job_metadata table, cached."""
+    try:
+        conn = sqlite3.connect('data/logs.db', timeout=30)
+        classes = pd.read_sql_query(
+            "SELECT value FROM job_metadata WHERE job_id = ? AND type = 'class'",
+            conn,
+            params=[job_id]
+        )['value'].dropna().unique().tolist()
+        services = pd.read_sql_query(
+            "SELECT value FROM job_metadata WHERE job_id = ? AND type = 'service'",
+            conn,
+            params=[job_id]
+        )['value'].dropna().unique().tolist()
+        conn.close()
+        logger.info(f"Fetched metadata for job_id: {job_id}, classes: {len(classes)}, services: {len(services)}")
+        return classes, services
+    except sqlite3.OperationalError as e:
+        logger.error(f"Database error fetching metadata for job_id {job_id}: {str(e)}")
+        st.session_state.notifications.append({
+            'type': 'error',
+            'message': f"Database error fetching metadata: {str(e)}",
+            'timestamp': time.time()
+        })
+        return [], []
+    except Exception as e:
+        logger.error(f"Error fetching metadata for job_id {job_id}: {str(e)}")
+        st.session_state.notifications.append({
+            'type': 'error',
+            'message': f"Error fetching metadata: {str(e)}",
+            'timestamp': time.time()
+        })
+        return [], []
+
+@st.cache_data
+def get_logs_by_class_and_level(job_id: str, class_name: str, level: str, page: int, logs_per_page: int, search_query: str = None, use_regex: bool = False):
+    """Retrieve logs by class and level from SQLite, cached."""
+    try:
+        conn = sqlite3.connect('data/logs.db', timeout=30)
+        offset = (page - 1) * logs_per_page
+        query = """
+            SELECT timestamp, log_message, level, class
+            FROM logs
+            WHERE job_id = ? AND class = ? AND level = ?
+        """
+        params = [job_id, class_name, level]
+        
+        if search_query:
+            if use_regex:
+                query += " AND log_message REGEXP ?"
+                params.append(search_query)
+            else:
+                query += " AND log_message LIKE ?"
+                params.append(f'%{search_query}%')
+        
+        query += " LIMIT ? OFFSET ?"
+        params.extend([logs_per_page, offset])
+        
+        logs_df = pd.read_sql_query(query, conn, params=params)
+        count_query = """
+            SELECT COUNT(*) as total
+            FROM logs
+            WHERE job_id = ? AND class = ? AND level = ?
+        """
+        count_params = [job_id, class_name, level]
+        
+        if search_query:
+            if use_regex:
+                count_query += " AND log_message REGEXP ?"
+                count_params.append(search_query)
+            else:
+                count_query += " AND log_message LIKE ?"
+                count_params.append(f'%{search_query}%')
+        
+        total_logs = pd.read_sql_query(count_query, conn, params=count_params)['total'].iloc[0]
+        conn.close()
+        logger.debug(f"Fetched {len(logs_df)} logs, total_logs={total_logs}, page={page}")
+        return logs_df.to_dict('records'), total_logs
+    except sqlite3.OperationalError as e:
+        logger.error(f"Database error fetching logs by class and level: {str(e)}")
+        st.session_state.notifications.append({
+            'type': 'error',
+            'message': f"Database error: {str(e)}",
+            'timestamp': time.time()
+        })
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching logs by class and level: {str(e)}")
+        st.session_state.notifications.append({
+            'type': 'error',
+            'message': f"Error fetching logs: {str(e)}",
+            'timestamp': time.time()
+        })
+        raise
+
+@st.cache_data
+def get_logs_by_service_and_level(job_id: str, service_name: str, level: str, page: int, logs_per_page: int, search_query: str = None, use_regex: bool = False):
+    """Retrieve logs by service and level from SQLite, cached."""
+    try:
+        conn = sqlite3.connect('data/logs.db', timeout=30)
+        offset = (page - 1) * logs_per_page
+        query = """
+            SELECT timestamp, log_message, level, service
+            FROM logs
+            WHERE job_id = ? AND service = ? AND level = ?
+        """
+        params = [job_id, service_name, level]
+        
+        if search_query:
+            if use_regex:
+                query += " AND log_message REGEXP ?"
+                params.append(search_query)
+            else:
+                query += " AND log_message LIKE ?"
+                params.append(f'%{search_query}%')
+        
+        query += " LIMIT ? OFFSET ?"
+        params.extend([logs_per_page, offset])
+        
+        logs_df = pd.read_sql_query(query, conn, params=params)
+        count_query = """
+            SELECT COUNT(*) as total
+            FROM logs
+            WHERE job_id = ? AND service = ? AND level = ?
+        """
+        count_params = [job_id, service_name, level]
+        
+        if search_query:
+            if use_regex:
+                count_query += " AND log_message REGEXP ?"
+                count_params.append(search_query)
+            else:
+                count_query += " AND log_message LIKE ?"
+                count_params.append(f'%{search_query}%')
+        
+        total_logs = pd.read_sql_query(count_query, conn, params=count_params)['total'].iloc[0]
+        conn.close()
+        logger.debug(f"Fetched {len(logs_df)} logs, total_logs={total_logs}, page={page}")
+        return logs_df.to_dict('records'), total_logs
+    except sqlite3.OperationalError as e:
+        logger.error(f"Database error fetching logs by service and level: {str(e)}")
+        st.session_state.notifications.append({
+            'type': 'error',
+            'message': f"Database error: {str(e)}",
+            'timestamp': time.time()
+        })
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching logs by service and level: {str(e)}")
+        st.session_state.notifications.append({
+            'type': 'error',
+            'message': f"Error fetching logs: {str(e)}",
+            'timestamp': time.time()
+        })
+        raise
+
+@retry(stop_max_attempt_number=3, wait_exponential_multiplier=1000, wait_exponential_max=10000)
+def start_analysis(folder_path):
+    """Start a new analysis job via backend API."""
+    if not st.session_state.backend_available:
+        st.session_state.notifications.append({
+            'type': 'error',
+            'message': "Backend server is not running. Please start `python backend.py`.",
+            'timestamp': time.time()
+        })
+        return
+    try:
+        response = requests.post(f"{BACKEND_URL}/jobs/start", json={"folder_path": folder_path}, timeout=10)
+        response.raise_for_status()
+        job = response.json()
+        st.session_state.selected_job_id = job['job_id']
+        st.session_state.notifications.append({
+            'type': 'success',
+            'message': f"Started analysis job: {job['job_id']}",
+            'timestamp': time.time()
+        })
+        logger.info(f"Started analysis for folder: {folder_path}, job_id: {job['job_id']}")
+    except requests.RequestException as e:
+        logger.error(f"Error starting analysis: {str(e)}")
+        st.session_state.notifications.append({
+            'type': 'error',
+            'message': f"Error starting analysis: {str(e)}",
+            'timestamp': time.time()
+        })
+
+@retry(stop_max_attempt_number=3, wait_exponential_multiplier=1000, wait_exponential_max=10000)
+def pause_analysis(job_id):
+    """Pause an analysis job via backend API."""
+    if not st.session_state.backend_available:
+        st.session_state.notifications.append({
+            'type': 'error',
+            'message': "Backend server is not running. Please start `python backend.py`.",
+            'timestamp': time.time()
+        })
+        return
+    try:
+        response = requests.post(f"{BACKEND_URL}/jobs/{job_id}/pause", timeout=10)
+        response.raise_for_status()
+        st.session_state.notifications.append({
+            'type': 'success',
+            'message': f"Paused analysis job: {job_id}",
+            'timestamp': time.time()
+        })
+        logger.info(f"Paused analysis job: {job_id}")
+    except requests.RequestException as e:
+        logger.error(f"Error pausing analysis: {str(e)}")
+        st.session_state.notifications.append({
+            'type': 'error',
+            'message': f"Error pausing analysis: {str(e)}",
+            'timestamp': time.time()
+        })
+
+@retry(stop_max_attempt_number=3, wait_exponential_multiplier=1000, wait_exponential_max=10000)
+def resume_analysis(job_id):
+    """Resume a paused analysis job via backend API."""
+    if not st.session_state.backend_available:
+        st.session_state.notifications.append({
+            'type': 'error',
+            'message': "Backend server is not running. Please start `python backend.py`.",
+            'timestamp': time.time()
+        })
+        return
+    try:
+        response = requests.post(f"{BACKEND_URL}/jobs/{job_id}/resume", timeout=10)
+        response.raise_for_status()
+        st.session_state.notifications.append({
+            'type': 'success',
+            'message': f"Resumed analysis job: {job_id}",
+            'timestamp': time.time()
+        })
+        logger.info(f"Resumed analysis job: {job_id}")
+    except requests.RequestException as e:
+        logger.error(f"Error resuming analysis: {str(e)}")
+        st.session_state.notifications.append({
+            'type': 'error',
+            'message': f"Error resuming analysis: {str(e)}",
+            'timestamp': time.time()
+        })
+
+def view_analysis(visualizer):
+    """View analysis results for the selected job with progress feedback in main page."""
+    try:
+        if not st.session_state.selected_job_id:
+            st.session_state.notifications.append({
+                'type': 'warning',
+                'message': "Please select a job to view analysis",
+                'timestamp': time.time()
+            })
+            return
+        
+        with st.container():
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            with st.spinner("Loading analysis data..."):
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                steps = 4
+                step_increment = 1.0 / steps
+                
+                status_text.text("Fetching timeline data...")
+                timeline_data = get_analysis_data(job_id=st.session_state.selected_job_id, query_type='timeline')
+                # Sort timeline data by hour
+                if not timeline_data.empty:
+                    timeline_data['hour'] = pd.to_datetime(timeline_data['hour'])
+                    timeline_data = timeline_data.sort_values('hour')
+                progress_bar.progress(0.25)
+                
+                status_text.text("Fetching class-level counts...")
+                level_counts_by_class = get_analysis_data(job_id=st.session_state.selected_job_id, query_type='class')
+                # Pivot class data: class as index, levels as columns
+                if not level_counts_by_class.empty:
+                    class_pivot = level_counts_by_class.pivot(index='class', columns='level', values='count').fillna(0)
+                    # Ensure all log levels are present as columns
+                    config = load_config()
+                    log_levels = config['app']['log_levels']
+                    for level in log_levels:
+                        if level not in class_pivot.columns:
+                            class_pivot[level] = 0
+                    class_pivot = class_pivot.reset_index()
+                else:
+                    class_pivot = pd.DataFrame(columns=['class'] + log_levels)
+                progress_bar.progress(0.50)
+                
+                status_text.text("Fetching service-level counts...")
+                level_counts_by_service = get_analysis_data(job_id=st.session_state.selected_job_id, query_type='service')
+                # Pivot service data: service as index, levels as columns
+                if not level_counts_by_service.empty:
+                    service_pivot = level_counts_by_service.pivot(index='service', columns='level', values='count').fillna(0)
+                    # Ensure all log levels are present as columns
+                    for level in log_levels:
+                        if level not in service_pivot.columns:
+                            service_pivot[level] = 0
+                    service_pivot = service_pivot.reset_index()
+                else:
+                    service_pivot = pd.DataFrame(columns=['service'] + log_levels)
+                progress_bar.progress(0.75)
+                
+                status_text.text("Fetching class and service totals...")
+                # Calculate total counts for class and service bar/pie charts
+                class_totals = level_counts_by_class.groupby('class')['count'].sum().reset_index()
+                service_totals = level_counts_by_service.groupby('service')['count'].sum().reset_index()
+                progress_bar.progress(1.0)
+                
+                if all(df.empty for df in [timeline_data, level_counts_by_class, level_counts_by_service, class_totals, service_totals]):
+                    st.session_state.notifications.append({
+                        'type': 'warning',
+                        'message': "No analysis data available for this job",
+                        'timestamp': time.time()
+                    })
+                    progress_bar.empty()
+                    status_text.empty()
+                    st.markdown('</div>', unsafe_allow_html=True)
+                    return
+                
+                st.session_state.dashboard_data = {
+                    'timeline_data': timeline_data,
+                    'class_pivot': class_pivot,
+                    'service_pivot': service_pivot,
+                    'class_totals': class_totals,
+                    'service_totals': service_totals
+                }
+                
+                st.session_state.show_dashboard = True
+                
+                st.session_state.notifications.append({
+                    'type': 'success',
+                    'message': "Analysis data loaded successfully",
+                    'timestamp': time.time()
+                })
+                
+                progress_bar.empty()
+                status_text.empty()
+            st.markdown('</div>', unsafe_allow_html=True)
+            
+    except Exception as e:
+        logger.error(f"Error viewing analysis: {str(e)}")
+        st.session_state.notifications.append({
+            'type': 'error',
+            'message': f"Error viewing analysis: {str(e)}",
+            'timestamp': time.time()
+        })
+
+def download_results(job_id):
+    """Download analysis results as Excel."""
+    try:
+        with st.spinner("Generating Excel file..."):
+            excel_file = export_to_excel(job_id)
+            with open(excel_file, 'rb') as f:
+                st.download_button(
+                    label="Download Excel",
+                    data=f,
+                    file_name=f"analysis_results_{job_id}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+            st.session_state.notifications.append({
+                'type': 'success',
+                'message': "Excel file generated successfully",
+                'timestamp': time.time()
+            })
+    except FileNotFoundError:
+        logger.error(f"Excel file not found for job_id: {job_id}")
+        st.session_state.notifications.append({
+            'type': 'error',
+            'message': "Excel file could not be generated",
+            'timestamp': time.time()
+        })
+    except Exception as e:
+        logger.error(f"Error downloading results: {str(e)}")
+        st.session_state.notifications.append({
+            'type': 'error',
+            'message': f"Error downloading results: {str(e)}",
+            'timestamp': time.time()
+        })
+
+def process_csv_files(uploaded_files):
+    """Process uploaded CSV files."""
+    csv_data = {}
+    for file in uploaded_files:
+        try:
+            df = pd.read_csv(file)
+            file_name = file.name.lower().replace('.csv', '')
+            if file_name in [
+                'class_level_counts', 'level_summary', 'class_summary', 'pod_summary',
+                'container_summary', 'host_summary', 'class_level_pod', 'hourly_level_counts',
+                'thread_summary', 'error_analysis', 'time_range'
+            ]:
+                csv_data[file_name] = df
+            else:
+                st.session_state.csv_notifications.append({
+                    'type': 'warning',
+                    'message': f"Unsupported CSV file: {file.name}",
+                    'timestamp': time.time()
+                })
+        except Exception as e:
+            logger.error(f"Error processing CSV {file.name}: {str(e)}")
+            st.session_state.csv_notifications.append({
+                'type': 'error',
+                'message': f"Error processing CSV {file.name}: {str(e)}",
+                'timestamp': time.time()
+            })
+    return csv_data
+
+def display_notifications():
+    """Display notifications with 5-second auto-expiry."""
+    current_time = time.time()
+    
+    # Clear expired notifications
+    st.session_state.notifications = [n for n in st.session_state.notifications if current_time - n['timestamp'] < 5]
+    
+    # Render notifications in a single container
+    notification_container = st.empty()
+    with notification_container.container():
+        for i, notification in enumerate(st.session_state.notifications):
+            logger.debug(f"Displaying notification {i}: {notification['message']}")
+            if notification['type'] == 'success':
+                st.markdown(
+                    f'<div class="notification-success" key="notification_{i}_{notification["timestamp"]}">✅ {notification["message"]}</div>',
+                    unsafe_allow_html=True
+                )
+            elif notification['type'] == 'error':
+                st.markdown(
+                    f'<div class="notification-error" key="notification_{i}_{notification["timestamp"]}">❌ {notification["message"]}</div>',
+                    unsafe_allow_html=True
+                )
+            elif notification['type'] == 'warning':
+                st.markdown(
+                    f'<div class="notification-warning" key="notification_{i}_{notification["timestamp"]}">⚠️ {notification["message"]}</div>',
+                    unsafe_allow_html=True
+                )
+    
+    # Force clear after 5 seconds
+    if st.session_state.notifications and current_time - st.session_state.last_notification_clear >= 5:
+        st.session_state.notifications = []
+        st.session_state.last_notification_clear = current_time
+        notification_container.empty()
+        logger.debug("Cleared notification container eigenlijk")
+        st.experimental_rerun()
+
+def display_csv_notifications():
+    """Display CSV-specific notifications with 5-second auto-expiry."""
+    current_time = time.time()
+    
+    # Clear expired notifications
+    st.session_state.csv_notifications = [n for n in st.session_state.csv_notifications if current_time - n['timestamp'] < 5]
+    
+    # Render notifications in a single container
+    csv_notification_container = st.empty()
+    with csv_notification_container.container():
+        for i, notification in enumerate(st.session_state.csv_notifications):
+            logger.debug(f"Displaying CSV notification {i}: {notification['message']}")
+            if notification['type'] == 'success':
+                st.markdown(
+                    f'<div class="notification-success" key="csv_notification_{i}_{notification["timestamp"]}">✅ {notification["message"]}</div>',
+                    unsafe_allow_html=True
+                )
+            elif notification['type'] == 'error':
+                st.markdown(
+                    f'<div class="notification-error" key="csv_notification_{i}_{notification["timestamp"]}">❌ {notification["message"]}</div>',
+                    unsafe_allow_html=True
+                )
+            elif notification['type'] == 'warning':
+                st.markdown(
+                    f'<div class="notification-warning" key="csv_notification_{i}_{notification["timestamp"]}">⚠️ {notification["message"]}</div>',
+                    unsafe_allow_html=True
+                )
+    
+    # Force clear after 5 seconds
+    if st.session_state.csv_notifications and current_time - st.session_state.last_notification_clear >= 5:
+        st.session_state.csv_notifications = []
+        st.session_state.last_notification_clear = current_time
+        csv_notification_container.empty()
+        logger.debug("Cleared CSV notification container")
+        st.experimental_rerun()
+
+def update_selected_job_id():
+    """Update selected job ID in session state for Log Analysis tab."""
+    selected_job = st.session_state.job_select
+    if selected_job != 'Select a job...':
+        st.session_state.selected_job_id = selected_job
+        st.session_state.show_dashboard = False
+    else:
+        st.session_state.selected_job_id = None
+        st.session_state.show_dashboard = False
+
+def update_log_viewer_job_id():
+    """Update selected job ID for Log Viewer tab and manage cache."""
+    selected_job = st.session_state.log_viewer_job_select
+    if selected_job != 'Select a job...':
+        if st.session_state.log_viewer_job_id != selected_job:
+            st.session_state.log_viewer_job_id = selected_job
+            if st.session_state.log_viewer_last_job_id != selected_job:
+                get_job_metadata.clear()
+                get_logs_by_class_and_level.clear()
+                get_logs_by_service_and_level.clear()
+                st.session_state.cached_job_id = selected_job
+                st.session_state.log_viewer_last_job_id = selected_job
+                logger.info(f"Cleared cache for new job_id: {selected_job}")
+            # Reset pagination
+            st.session_state.log_viewer_current_page = 1
+            st.session_state.log_viewer_total_pages = 1
+            st.session_state.log_viewer_logs = []
+            st.session_state.log_viewer_total_logs = 0
+    else:
+        st.session_state.log_viewer_job_id = None
+        get_job_metadata.clear()
+        get_logs_by_class_and_level.clear()
+        get_logs_by_service_and_level.clear()
+        st.session_state.cached_job_id = None
+        st.session_state.log_viewer_last_job_id = None
+        st.session_state.log_viewer_current_page = 1
+        st.session_state.log_viewer_total_pages = 1
+        st.session_state.log_viewer_logs = []
+        st.session_state.log_viewer_total_logs = 0
+
+def main():
+    """Main Streamlit application."""
+    st.set_page_config(page_title="Saviynt Log Analyzer", layout="wide", initial_sidebar_state="expanded")
+    
+    import os
+    os.makedirs('data', exist_ok=True)
+    initialize_session_state()
+    
+    if not st.session_state.db_initialized:
+        try:
+            init_db()
+            st.session_state.db_initialized = True
+        except Exception as e:
+            logger.error(f"Failed to initialize database: {str(e)}")
+            st.error(f"Failed to initialize database: {str(e)}")
+            return
+    
+    apply_custom_css()
+    check_backend_health()
+
+    st.markdown(
+        """
+        <div class="header">
+            <h1>Saviynt Log Analyzer</h1>
+            <p>Unleash the Power of Log Analytics with Unmatched Precision</p>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    tab1, tab2, tab3 = st.tabs(["📊 Log Analysis", "🔍 Log Viewer", "📈 CSV Visualization"])
+
+    with tab1:
+        st.markdown('<div class="tab-content">', unsafe_allow_html=True)
+        st.header("Log Analysis")
+        config = load_config()
+        visualizer = Visualizer(config)
+
+        job_status_df = get_job_status()
+        job_options = ['Select a job...']
+        if not job_status_df.empty and 'job_id' in job_status_df.columns:
+            job_options += job_status_df['job_id'].tolist()
+        else:
+            st.info("No jobs available. Start a new analysis to create a job.")
+
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            st.selectbox(
+                "Select JOBID",
+                options=job_options,
+                key="job_select",
+                on_change=update_selected_job_id,
+                help="Choose a job to view its analysis results"
+            )
+        with col2:
+            st.markdown('<div class="tooltip">', unsafe_allow_html=True)
+            if st.button("Clear Cache", key="clear_cache"):
+                st.cache_data.clear()
+                st.cache_resource.clear()
+                st.session_state.notifications.append({
+                    'type': 'success',
+                    'message': "Cache cleared successfully",
+                    'timestamp': time.time()
+                })
+            st.markdown('<span class="tooltiptext">Clears cached data to refresh the application</span></div>', unsafe_allow_html=True)
+
+        with st.container():
+            if st.session_state.selected_job_id and not job_status_df.empty:
+                job_info = job_status_df[job_status_df['job_id'] == st.session_state.selected_job_id].iloc[0]
+                st.markdown(
+                    f"""
+                    <div class="card">
+                        <h3 class="text-lg font-semibold text-gray-800">Job Details</h3>
+                        <p><strong>Job ID:</strong> {st.session_state.selected_job_id}</p>
+                        <p><strong>Folder Path:</strong> {job_info.get('folder_path', 'N/A')}</p>
+                        <p><strong>Status:</strong> {job_info.get('status', 'N/A')}</p>
+                        <p><strong>Files Processed:</strong> {job_info.get('files_processed', 0)} / {job_info.get('total_files', 0)}</p>
+                        <p><strong>Start Time:</strong> {job_info.get('start_time', 'N/A')}</p>
+                        <p><strong>Last Updated:</strong> {job_info.get('last_updated', 'N/A')}</p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+
+            if st.session_state.show_dashboard and st.session_state.dashboard_data:
+                st.markdown('<div class="card">', unsafe_allow_html=True)
+                visualizer.display_dashboard(
+                    st.session_state.dashboard_data['timeline_data'],
+                    st.session_state.dashboard_data['class_pivot'],
+                    st.session_state.dashboard_data['service_pivot'],
+                    st.session_state.dashboard_data['class_totals'],
+                    st.session_state.dashboard_data['service_totals']
+                )
+                st.markdown('</div>', unsafe_allow_html=True)
+
+        with st.sidebar:
+            st.markdown('<div class="sidebar-content">', unsafe_allow_html=True)
+            st.header("Analysis Controls")
+            folder_path = st.text_input(
+                "Log Folder Path",
+                placeholder="e.g., data/customer_logs",
+                key="folder_path",
+                help="Enter the path to the folder containing .gz log files"
+            )
+            st.markdown('<div class="tooltip">', unsafe_allow_html=True)
+            if st.button("Start Analysis", key="start_analysis"):
+                if folder_path:
+                    if st.session_state.backend_available:
+                        start_analysis(folder_path)
+                    else:
+                        st.session_state.notifications.append({
+                            'type': 'error',
+                            'message': "Cannot start analysis: Backend server is not running. Please start `python backend.py`.",
+                            'timestamp': time.time()
+                        })
+                else:
+                    st.session_state.notifications.append({
+                        'type': 'error',
+                        'message': "Please provide a log folder path",
+                        'timestamp': time.time()
+                    })
+            st.markdown('<span class="tooltiptext">Starts a new analysis job for the specified folder</span></div>', unsafe_allow_html=True)
+
+            if st.session_state.selected_job_id:
+                st.markdown('<div class="tooltip">', unsafe_allow_html=True)
+                if st.button("Pause Analysis", key="pause_analysis"):
+                    if st.session_state.backend_available:
+                        pause_analysis(st.session_state.selected_job_id)
+                    else:
+                        st.session_state.notifications.append({
+                            'type': 'error',
+                            'message': "Cannot pause analysis: Backend server is not running. Please start `python backend.py`.",
+                            'timestamp': time.time()
+                        })
+                st.markdown('<span class="tooltiptext">Pauses the selected analysis job</span></div>', unsafe_allow_html=True)
+                
+                st.markdown('<div class="tooltip">', unsafe_allow_html=True)
+                if st.button("Resume Analysis", key="resume_analysis"):
+                    if st.session_state.backend_available:
+                        resume_analysis(st.session_state.selected_job_id)
+                    else:
+                        st.session_state.notifications.append({
+                            'type': 'error',
+                            'message': "Cannot resume analysis: Backend server is not running. Please start `python backend.py`.",
+                            'timestamp': time.time()
+                        })
+                st.markdown('<span class="tooltiptext">Resumes a paused analysis job</span></div>', unsafe_allow_html=True)
+                
+                st.markdown('<div class="tooltip">', unsafe_allow_html=True)
+                if st.button("View Analysis", key="view_analysis"):
+                    view_analysis(visualizer)
+                st.markdown('<span class="tooltiptext">Displays analysis results for the selected job</span></div>', unsafe_allow_html=True)
+                
+                st.markdown('<div class="tooltip">', unsafe_allow_html=True)
+                if st.button("Download Results", key="download_results"):
+                    download_results(st.session_state.selected_job_id)
+                st.markdown('<span class="tooltiptext">Downloads analysis results as an Excel file</span></div>', unsafe_allow_html=True)
+            
+            if st.button("Check Backend Status", key="check_backend_status"):
+                check_backend_health()
+            
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        display_notifications()
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    with tab2:
+        st.markdown('<div class="tab-content">', unsafe_allow_html=True)
+        st.header("Log Viewer")
+        
+        job_status_df = get_job_status()
+        job_options = ['Select a job...']
+        if not job_status_df.empty and 'job_id' in job_status_df.columns:
+            job_options += job_status_df['job_id'].tolist()
+        else:
+            st.info("No jobs available. Start a new analysis in the Log Analysis tab to create a job.")
+        
+        st.selectbox(
+            "Select JOBID",
+            options=job_options,
+            key="log_viewer_job_select",
+            on_change=update_log_viewer_job_id,
+            help="Choose a job to view its logs"
+        )
+
+        if st.session_state.log_viewer_job_id:
+            config = load_config()
+            with st.spinner("Loading log viewer data..."):
+                classes, services = get_job_metadata(st.session_state.log_viewer_job_id)
+                class_options = ['None'] + classes if classes else ['None']
+                service_options = ['None'] + services if services else ['None']
+                
+                log_level = st.selectbox(
+                    "Select Log Level",
+                    config['app']['log_levels'],
+                    key="log_level_viewer",
+                    help="Choose a log level to filter logs"
+                )
+                col1, col2 = st.columns(2)
+                with col1:
+                    selected_class = st.selectbox(
+                        "Select Class",
+                        class_options,
+                        key="class_viewer",
+                        help="Select a class to view its logs"
+                    )
+                with col2:
+                    selected_service = st.selectbox(
+                        "Select Service",
+                        service_options,
+                        key="service_viewer",
+                        help="Select a service to view its logs"
+                    )
+                
+                search_query = st.text_input(
+                    "Search Logs",
+                    placeholder="Enter search term",
+                    key="search_viewer",
+                    help="Search logs by message content"
+                )
+                use_regex = st.checkbox("Use Regex", key="regex_viewer", help="Enable regex for search queries")
+                
+                logs_per_page = 50
+                page = st.number_input(
+                    "Page",
+                    min_value=1,
+                    max_value=max(1, st.session_state.log_viewer_total_pages),
+                    value=st.session_state.log_viewer_current_page,
+                    step=1,
+                    key="page_viewer",
+                    help="Select page for paginated results"
+                )
+                
+                if st.button("Fetch Logs", key="fetch_logs"):
+                    if selected_class == 'None' and selected_service == 'None':
+                        st.session_state.notifications.append({
+                            'type': 'error',
+                            'message': "Please select a class or service",
+                            'timestamp': time.time()
+                        })
+                    elif log_level not in config['app']['log_levels']:
+                        st.session_state.notifications.append({
+                            'type': 'error',
+                            'message': "Please select a valid log level",
+                            'timestamp': time.time()
+                        })
+                    else:
+                        with st.spinner("Fetching logs..."):
+                            try:
+                                st.session_state.log_viewer_current_page = page
+                                logs, total_logs = (get_logs_by_class_and_level if selected_class != 'None' else get_logs_by_service_and_level)(
+                                    st.session_state.log_viewer_job_id,
+                                    selected_class if selected_class != 'None' else selected_service,
+                                    log_level,
+                                    page,
+                                    logs_per_page,
+                                    search_query,
+                                    use_regex
+                                )
+                                st.session_state.log_viewer_logs = logs
+                                st.session_state.log_viewer_total_logs = total_logs
+                                st.session_state.log_viewer_total_pages = max(1, (total_logs + logs_per_page - 1) // logs_per_page)
+                                
+                                if logs:
+                                    st.dataframe(pd.DataFrame(logs), use_container_width=True)
+                                    st.markdown(f"**Total Logs:** {total_logs} | **Page:** {page} of {st.session_state.log_viewer_total_pages}")
+                                    st.download_button(
+                                        label="Download Logs as JSON",
+                                        data=json.dumps(logs, indent=2),
+                                        file_name=f"{log_level}_logs_page_{page}.json",
+                                        mime="application/json",
+                                        key=f"download_viewer_{page}"
+                                    )
+                                    st.session_state.notifications.append({
+                                        'type': 'success',
+                                        'message': f"Loaded {len(logs)} logs for page {page}",
+                                        'timestamp': time.time()
+                                    })
+                                else:
+                                    st.info("No logs found for the selected criteria")
+                                    st.session_state.log_viewer_logs = []
+                                    st.session_state.log_viewer_total_logs = 0
+                                    st.session_state.log_viewer_total_pages = 1
+                            except Exception as e:
+                                st.session_state.notifications.append({
+                                    'type': 'error',
+                                    'message': f"Failed to fetch logs: {str(e)}",
+                                    'timestamp': time.time()
+                                })
+                                st.session_state.log_viewer_logs = []
+                                st.session_state.log_viewer_total_logs = 0
+                
+                # Display current logs if available
+                if st.session_state.log_viewer_logs:
+                    st.dataframe(pd.DataFrame(st.session_state.log_viewer_logs), use_container_width=True)
+                    st.markdown(f"**Total Logs:** {st.session_state.log_viewer_total_logs} | **Page:** {st.session_state.log_viewer_current_page} of {st.session_state.log_viewer_total_pages}")
+                    st.download_button(
+                        label="Download Logs as JSON",
+                        data=json.dumps(st.session_state.log_viewer_logs, indent=2),
+                        file_name=f"{log_level}_logs_page_{st.session_state.log_viewer_current_page}.json",
+                        mime="application/json",
+                        key=f"download_viewer_persistent_{st.session_state.log_viewer_current_page}"
+                    )
+        else:
+            st.info("Please select a job to view logs")
+        
+        display_notifications()
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    with tab3:
+        st.markdown('<div class="tab-content">', unsafe_allow_html=True)
+        st.header("CSV Visualization")
+        uploaded_files = st.file_uploader(
+            "Upload CSV Files",
+            accept_multiple_files=True,
+            type=['csv'],
+            help="Upload CSV files for visualization"
+        )
+        if uploaded_files:
+            with st.spinner("Processing CSV files..."):
+                csv_data = process_csv_files(uploaded_files)
+                visualizer = Visualizer(load_config())
+                visualizer.display_csv_dashboard(csv_data)
+                display_csv_notifications()
+        st.markdown('</div>', unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()

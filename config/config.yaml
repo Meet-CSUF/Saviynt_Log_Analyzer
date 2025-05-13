@@ -1,9 +1,14 @@
 app:
-  log_levels: ["DEBUG", "INFO", "WARN", "ERROR", "FATAL"]
-  update_interval: 30
-  theme:
-    primary_color: "#12133f"
-    secondary_color: "#2A2B5A"
-paths:
-  data_dir: "data/processed"
-  state_dir: "data/state"
+  log_levels:
+    - DEBUG
+    - ERROR
+    - INFO
+    - JOB
+    - NEW
+    - TEST
+    - TSAP
+    - UNKNOWN
+    - WARN
+    - FATAL
+  data_dir: data
+  state_dir: data
