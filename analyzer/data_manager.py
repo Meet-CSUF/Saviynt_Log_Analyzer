@@ -305,13 +305,12 @@ def _fetch_analysis_data(job_id: str, query_type: str) -> pd.DataFrame:
                 SELECT hour, level, count
                 FROM timeline_counts
                 WHERE job_id = ?
+                ORDER BY hour
             """, conn, params=[job_id])
-            # Convert hour to datetime for timeline queries
+            # Convert hour to datetime for consistent plotting
             if not df.empty:
-                df['hour'] = pd.to_datetime(df['hour'], errors='coerce')
+                df['hour'] = pd.to_datetime(df['hour'], format='%Y-%m-%d %H:00:00', errors='coerce')
                 df = df.dropna(subset=['hour'])  # Drop rows with invalid datetime
-                df = df.sort_values('hour')  # Sort by datetime
-                logger.debug(f"Timeline data for job_id {job_id}: {len(df)} rows after datetime conversion")
         
         elif query_type == 'class_service':
             df = pd.read_sql_query("""
@@ -332,7 +331,6 @@ def _fetch_analysis_data(job_id: str, query_type: str) -> pd.DataFrame:
                 df = pd.DataFrame(columns=['service', 'level', 'count'])
             elif query_type == 'timeline':
                 df = pd.DataFrame(columns=['hour', 'level', 'count'])
-                logger.warning(f"No timeline data found for job_id {job_id}")
             elif query_type == 'class_service':
                 df = pd.DataFrame(columns=['class', 'service', 'count'])
         

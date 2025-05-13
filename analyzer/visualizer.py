@@ -31,12 +31,16 @@ class Visualizer:
             # Timeline Data
             if not timeline_data.empty:
                 st.markdown("### Log Counts Over Time")
-                logger.debug(f"Timeline data shape: {timeline_data.shape}, columns: {timeline_data.columns}")
-                logger.debug(f"Timeline data sample: {timeline_data.head().to_dict()}")
-                
-                # Ensure hour is datetime
+                # Ensure hour is in datetime format
                 timeline_data['hour'] = pd.to_datetime(timeline_data['hour'], errors='coerce')
-                timeline_data = timeline_data.dropna(subset=['hour'])
+                if timeline_data['hour'].isna().any():
+                    logger.warning("Some timeline entries have invalid datetime values")
+                    st.session_state.notifications.append({
+                        'type': 'warning',
+                        'message': "Some timeline entries have invalid datetime values and were excluded",
+                        'timestamp': time.time()
+                    })
+                    timeline_data = timeline_data.dropna(subset=['hour'])
                 
                 if not timeline_data.empty:
                     fig_timeline = px.line(
@@ -56,17 +60,24 @@ class Visualizer:
                         xaxis=dict(
                             tickmode='auto',
                             nticks=20,
-                            tickformat="%Y-%m-%d %H:%M"
+                            rangeslider_visible=True,
+                            showgrid=True,
+                            gridcolor='rgba(200, 200, 200, 0.5)'
                         ),
-                        showlegend=True
+                        yaxis=dict(
+                            showgrid=True,
+                            gridcolor='rgba(200, 200, 200, 0.5)'
+                        ),
+                        height=600,
+                        margin=dict(b=150)
                     )
                     st.plotly_chart(fig_timeline, use_container_width=True)
                 else:
-                    st.warning("No valid timeline data available for plotting after datetime conversion")
-                    logger.warning("Timeline data empty after datetime conversion")
+                    st.info("No valid timeline data available for plotting")
+                    logger.info("No valid timeline data after filtering")
             else:
-                st.warning("No timeline data available for this job")
-                logger.warning("Timeline data is empty")
+                st.info("No timeline data available")
+                logger.info("Timeline data is empty")
             
             # Log Level Counts by Class
             if not class_pivot.empty:
