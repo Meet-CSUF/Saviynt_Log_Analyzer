@@ -979,7 +979,7 @@ def main():
                 )
                 use_regex = st.checkbox("Use Regex", key="regex_viewer", help="Enable regex for search queries")
                 
-                logs_per_page = 100000
+                logs_per_page = 1000000
                 page = st.number_input(
                     "Page",
                     min_value=1,

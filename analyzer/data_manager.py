@@ -261,7 +261,7 @@ def get_logs_by_class_and_level(job_id: str, class_name: str, level: str, page: 
         st.session_state.notifications.append({
             'type': 'error',
             'message': f"Error fetching logs: {str(e)}",
-機制: time.time()
+'           timestamp': time.time()
         })
         raise
 
