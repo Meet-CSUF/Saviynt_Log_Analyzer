@@ -89,26 +89,38 @@ class Visualizer:
                 st.markdown("### Log Level Counts by Service")
                 st.dataframe(service_pivot, use_container_width=True)
             
-            # Class Totals Bar Plot
-            if not class_totals.empty:
-                st.markdown("### Class Distribution")
+            # Class Distribution Bar Plot (Stacked by Log Level)
+            if not class_pivot.empty:
+                st.markdown("### Class Distribution by Log Level")
+                # Melt the pivot table to long format for stacked bar plot
+                class_melted = class_pivot.melt(id_vars=['class'], value_vars=self.log_levels,
+                                               var_name='level', value_name='count')
                 fig_class_bar = px.bar(
-                    class_totals,
+                    class_melted,
                     x='class',
                     y='count',
-                    title="Total Logs by Class",
-                    labels={'class': 'Class', 'count': 'Count'},
+                    color='level',
+                    barmode='stack',
+                    title="Log Counts by Class and Level",
+                    labels={'class': 'Class', 'count': 'Count', 'level': 'Log Level'},
                     color_discrete_sequence=px.colors.qualitative.Plotly
                 )
                 fig_class_bar.update_layout(
                     xaxis_title="Class",
                     yaxis_title="Count",
+                    legend_title="Log Level",
                     xaxis_tickangle=45,
-                    margin=dict(b=150)
+                    height=600,
+                    margin=dict(b=150),
+                    yaxis=dict(
+                        showgrid=True,
+                        gridcolor='rgba(200, 200, 200, 0.5)'
+                    )
                 )
                 st.plotly_chart(fig_class_bar, use_container_width=True)
+                logger.info("Displayed stacked bar plot for class distribution")
                 
-                # Class Pie Chart
+                # Class Pie Chart (unchanged)
                 st.markdown("### Class Distribution (Pie)")
                 fig_class_pie = px.pie(
                     class_totals,
@@ -119,26 +131,38 @@ class Visualizer:
                 )
                 st.plotly_chart(fig_class_pie, use_container_width=True)
             
-            # Service Totals Bar Plot
-            if not service_totals.empty:
-                st.markdown("### Service Distribution")
+            # Service Distribution Bar Plot (Stacked by Log Level)
+            if not service_pivot.empty:
+                st.markdown("### Service Distribution by Log Level")
+                # Melt the pivot table to long format for stacked bar plot
+                service_melted = service_pivot.melt(id_vars=['service'], value_vars=self.log_levels,
+                                                  var_name='level', value_name='count')
                 fig_service_bar = px.bar(
-                    service_totals,
+                    service_melted,
                     x='service',
                     y='count',
-                    title="Total Logs by Service",
-                    labels={'service': 'Service', 'count': 'Count'},
+                    color='level',
+                    barmode='stack',
+                    title="Log Counts by Service and Level",
+                    labels={'service': 'Service', 'count': 'Count', 'level': 'Log Level'},
                     color_discrete_sequence=px.colors.qualitative.Plotly
                 )
                 fig_service_bar.update_layout(
                     xaxis_title="Service",
                     yaxis_title="Count",
+                    legend_title="Log Level",
                     xaxis_tickangle=45,
-                    margin=dict(b=150)
+                    height=600,
+                    margin=dict(b=150),
+                    yaxis=dict(
+                        showgrid=True,
+                        gridcolor='rgba(200, 200, 200, 0.5)'
+                    )
                 )
                 st.plotly_chart(fig_service_bar, use_container_width=True)
+                logger.info("Displayed stacked bar plot for service distribution")
                 
-                # Service Pie Chart
+                # Service Pie Chart (unchanged)
                 st.markdown("### Service Distribution (Pie)")
                 fig_service_pie = px.pie(
                     service_totals,
