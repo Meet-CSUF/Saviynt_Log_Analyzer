@@ -236,6 +236,7 @@ def apply_custom_css():
         }
         .stSelectbox>div>select {
             border-radius: 12px;
+           ,f
             border: 1px solid #D1D5DB;
             padding: 0.75rem;
             background: rgba(255, 255, 255, 0.9);
@@ -359,7 +360,7 @@ def get_job_status():
         })
         return pd.DataFrame()
 
-@st.cache_data
+@st.cache_data(hash_funcs={str: lambda x: x})
 def get_job_metadata(job_id: str):
     """Fetch unique classes and services for a job from job_metadata table, cached."""
     try:
@@ -394,12 +395,17 @@ def get_job_metadata(job_id: str):
         })
         return [], []
 
-@st.cache_data
+@st.cache_data(hash_funcs={str: lambda x: x})
 def get_logs_by_class_and_level(job_id: str, class_name: str, level: str, page: int, logs_per_page: int, search_query: str = None, use_regex: bool = False):
     """Retrieve logs by class and level from SQLite, cached."""
     try:
+        start_time = time.time()
         conn = sqlite3.connect('data/logs.db', timeout=30)
+        cursor = conn.cursor()
         offset = (page - 1) * logs_per_page
+        
+        # Log query parameters
+        logger.debug(f"get_logs_by_class_and_level: job_id={job_id}, class={class_name}, level={level}, page={page}, logs_per_page={logs_per_page}, search_query={search_query}, use_regex={use_regex}")
         
         # Base query
         if level == "ALL":
@@ -430,8 +436,15 @@ def get_logs_by_class_and_level(job_id: str, class_name: str, level: str, page: 
         query += " ORDER BY timestamp LIMIT ? OFFSET ?"
         params.extend([logs_per_page, offset])
         
-        # Execute query
-        logs_df = pd.read_sql_query(query, conn, params=params)
+        # Log the exact query
+        logger.debug(f"Executing SQL: {query} with params: {params}")
+        
+        # Execute data query
+        cursor.execute(query, params)
+        logs = [
+            {"timestamp": row[0], "log_message": row[1], "level": row[2], "class": row[3]}
+            for row in cursor.fetchall()
+        ]
         
         # Count query
         if level == "ALL":
@@ -457,10 +470,14 @@ def get_logs_by_class_and_level(job_id: str, class_name: str, level: str, page: 
                 count_query += " AND log_message LIKE ?"
                 count_params.append(f'%{search_query}%')
         
-        total_logs = pd.read_sql_query(count_query, conn, params=count_params)['total'].iloc[0]
+        # Execute count query
+        cursor.execute(count_query, count_params)
+        total_logs = cursor.fetchone()[0]
+        
         conn.close()
-        logger.debug(f"Fetched {len(logs_df)} logs, total_logs={total_logs}, page={page}")
-        return logs_df.to_dict('records'), total_logs
+        query_time = time.time() - start_time
+        logger.debug(f"Fetched {len(logs)} logs, total_logs={total_logs}, page={page}, query_time={query_time:.2f}s")
+        return logs, total_logs
     except sqlite3.OperationalError as e:
         logger.error(f"Database error fetching logs by class and level: {str(e)}")
         st.session_state.notifications.append({
@@ -478,12 +495,17 @@ def get_logs_by_class_and_level(job_id: str, class_name: str, level: str, page: 
         })
         raise
 
-@st.cache_data
+@st.cache_data(hash_funcs={str: lambda x: x})
 def get_logs_by_service_and_level(job_id: str, service_name: str, level: str, page: int, logs_per_page: int, search_query: str = None, use_regex: bool = False):
     """Retrieve logs by service and level from SQLite, cached."""
     try:
+        start_time = time.time()
         conn = sqlite3.connect('data/logs.db', timeout=30)
+        cursor = conn.cursor()
         offset = (page - 1) * logs_per_page
+        
+        # Log query parameters
+        logger.debug(f"get_logs_by_service_and_level: job_id={job_id}, service={service_name}, level={level}, page={page}, logs_per_page={logs_per_page}, search_query={search_query}, use_regex={use_regex}")
         
         # Base query
         if level == "ALL":
@@ -514,8 +536,15 @@ def get_logs_by_service_and_level(job_id: str, service_name: str, level: str, pa
         query += " ORDER BY timestamp LIMIT ? OFFSET ?"
         params.extend([logs_per_page, offset])
         
-        # Execute query
-        logs_df = pd.read_sql_query(query, conn, params=params)
+        # Log the exact query
+        logger.debug(f"Executing SQL: {query} with params: {params}")
+        
+        # Execute data query
+        cursor.execute(query, params)
+        logs = [
+            {"timestamp": row[0], "log_message": row[1], "level": row[2], "service": row[3]}
+            for row in cursor.fetchall()
+        ]
         
         # Count query
         if level == "ALL":
@@ -541,10 +570,14 @@ def get_logs_by_service_and_level(job_id: str, service_name: str, level: str, pa
                 count_query += " AND log_message LIKE ?"
                 count_params.append(f'%{search_query}%')
         
-        total_logs = pd.read_sql_query(count_query, conn, params=count_params)['total'].iloc[0]
+        # Execute count query
+        cursor.execute(count_query, count_params)
+        total_logs = cursor.fetchone()[0]
+        
         conn.close()
-        logger.debug(f"Fetched {len(logs_df)} logs, total_logs={total_logs}, page={page}")
-        return logs_df.to_dict('records'), total_logs
+        query_time = time.time() - start_time
+        logger.debug(f"Fetched {len(logs)} logs, total_logs={total_logs}, page={page}, query_time={query_time:.2f}s")
+        return logs, total_logs
     except sqlite3.OperationalError as e:
         logger.error(f"Database error fetching logs by service and level: {str(e)}")
         st.session_state.notifications.append({

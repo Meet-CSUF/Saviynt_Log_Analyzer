@@ -22,6 +22,11 @@ def init_db():
         conn = sqlite3.connect('data/logs.db', timeout=30)
         cursor = conn.cursor()
         
+        # Optimize SQLite settings
+        cursor.execute('PRAGMA synchronous = OFF')
+        cursor.execute('PRAGMA journal_mode = WAL')
+        cursor.execute('PRAGMA cache_size = -20000')  # 20MB cache
+        
         # Jobs table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS jobs (
@@ -109,6 +114,8 @@ def init_db():
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_logs_job_id_class_level ON logs (job_id, class, level)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_logs_job_id_service_level ON logs (job_id, service, level)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs (timestamp)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_logs_job_id_class_timestamp_level ON logs (job_id, class, timestamp, level)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_logs_job_id_service_timestamp_level ON logs (job_id, service, timestamp, level)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_job_metadata_job_id_type ON job_metadata (job_id, type)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_class_level_counts_job_id ON class_level_counts (job_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_service_level_counts_job_id ON service_level_counts (job_id)')
@@ -117,7 +124,7 @@ def init_db():
         
         conn.commit()
         conn.close()
-        logger.info("Database initialized with tables and indexes")
+        logger.info("Database initialized with optimized tables and indexes")
     except sqlite3.OperationalError as e:
         logger.error(f"Database initialization error: {str(e)}")
         raise
@@ -159,174 +166,6 @@ def get_job_metadata(job_id: str):
             'timestamp': time.time()
         })
         return [], []
-
-@st.cache_data
-def get_logs_by_class_and_level(job_id: str, class_name: str, level: str, page: int, logs_per_page: int, search_query: str = None, use_regex: bool = False):
-    """Retrieve logs by class and level from SQLite, cached."""
-    try:
-        conn = sqlite3.connect('data/logs.db', timeout=30)
-        offset = (page - 1) * logs_per_page
-        
-        # Base query
-        if level == "ALL":
-            query = """
-                SELECT timestamp, log_message, level, class
-                FROM logs
-                WHERE job_id = ? AND class = ?
-            """
-            params = [job_id, class_name]
-        else:
-            query = """
-                SELECT timestamp, log_message, level, class
-                FROM logs
-                WHERE job_id = ? AND class = ? AND level = ?
-            """
-            params = [job_id, class_name, level]
-        
-        # Add search query if provided
-        if search_query and search_query.strip():
-            if use_regex:
-                query += " AND log_message REGEXP ?"
-                params.append(search_query)
-            else:
-                query += " AND log_message LIKE ?"
-                params.append(f'%{search_query}%')
-        
-        # Add sorting and pagination
-        query += " ORDER BY timestamp LIMIT ? OFFSET ?"
-        params.extend([logs_per_page, offset])
-        
-        # Execute query
-        logs_df = pd.read_sql_query(query, conn, params=params)
-        
-        # Count query
-        if level == "ALL":
-            count_query = """
-                SELECT COUNT(*) as total
-                FROM logs
-                WHERE job_id = ? AND class = ?
-            """
-            count_params = [job_id, class_name]
-        else:
-            count_query = """
-                SELECT COUNT(*) as total
-                FROM logs
-                WHERE job_id = ? AND class = ? AND level = ?
-            """
-            count_params = [job_id, class_name, level]
-        
-        if search_query and search_query.strip():
-            if use_regex:
-                count_query += " AND log_message REGEXP ?"
-                count_params.append(search_query)
-            else:
-                count_query += " AND log_message LIKE ?"
-                count_params.append(f'%{search_query}%')
-        
-        total_logs = pd.read_sql_query(count_query, conn, params=count_params)['total'].iloc[0]
-        conn.close()
-        logger.debug(f"Fetched {len(logs_df)} logs, total_logs={total_logs}, page={page}")
-        return logs_df.to_dict('records'), total_logs
-    except sqlite3.OperationalError as e:
-        logger.error(f"Database error fetching logs by class and level: {str(e)}")
-        st.session_state.notifications.append({
-            'type': 'error',
-            'message': f"Database error: {str(e)}",
-            'timestamp': time.time()
-        })
-        raise
-    except Exception as e:
-        logger.error(f"Error fetching logs by class and level: {str(e)}")
-        st.session_state.notifications.append({
-            'type': 'error',
-            'message': f"Error fetching logs: {str(e)}",
-            'timestamp': time.time()
-        })
-        raise
-
-@st.cache_data
-def get_logs_by_service_and_level(job_id: str, service_name: str, level: str, page: int, logs_per_page: int, search_query: str = None, use_regex: bool = False):
-    """Retrieve logs by service and level from SQLite, cached."""
-    try:
-        conn = sqlite3.connect('data/logs.db', timeout=30)
-        offset = (page - 1) * logs_per_page
-        
-        # Base query
-        if level == "ALL":
-            query = """
-                SELECT timestamp, log_message, level, service
-                FROM logs
-                WHERE job_id = ? AND service = ?
-            """
-            params = [job_id, service_name]
-        else:
-            query = """
-                SELECT timestamp, log_message, level, service
-                FROM logs
-                WHERE job_id = ? AND service = ? AND level = ?
-            """
-            params = [job_id, service_name, level]
-        
-        # Add search query if provided
-        if search_query and search_query.strip():
-            if use_regex:
-                query += " AND log_message REGEXP ?"
-                params.append(search_query)
-            else:
-                query += " AND log_message LIKE ?"
-                params.append(f'%{search_query}%')
-        
-        # Add sorting and pagination
-        query += " ORDER BY timestamp LIMIT ? OFFSET ?"
-        params.extend([logs_per_page, offset])
-        
-        # Execute query
-        logs_df = pd.read_sql_query(query, conn, params=params)
-        
-        # Count query
-        if level == "ALL":
-            count_query = """
-                SELECT COUNT(*) as total
-                FROM logs
-                WHERE job_id = ? AND service = ?
-            """
-            count_params = [job_id, service_name]
-        else:
-            count_query = """
-                SELECT COUNT(*) as total
-                FROM logs
-                WHERE job_id = ? AND service = ? AND level = ?
-            """
-            count_params = [job_id, service_name, level]
-        
-        if search_query and search_query.strip():
-            if use_regex:
-                count_query += " AND log_message REGEXP ?"
-                count_params.append(search_query)
-            else:
-                count_query += " AND log_message LIKE ?"
-                count_params.append(f'%{search_query}%')
-        
-        total_logs = pd.read_sql_query(count_query, conn, params=count_params)['total'].iloc[0]
-        conn.close()
-        logger.debug(f"Fetched {len(logs_df)} logs, total_logs={total_logs}, page={page}")
-        return logs_df.to_dict('records'), total_logs
-    except sqlite3.OperationalError as e:
-        logger.error(f"Database error fetching logs by service and level: {str(e)}")
-        st.session_state.notifications.append({
-            'type': 'error',
-            'message': f"Database error: {str(e)}",
-            'timestamp': time.time()
-        })
-        raise
-    except Exception as e:
-        logger.error(f"Error fetching logs by service and level: {str(e)}")
-        st.session_state.notifications.append({
-            'type': 'error',
-            'message': f"Error fetching logs: {str(e)}",
-            'timestamp': time.time()
-        })
-        raise
 
 @st.cache_data
 def _fetch_analysis_data(job_id: str, query_type: str) -> pd.DataFrame:
@@ -486,6 +325,7 @@ def export_to_excel(job_id: str) -> str:
         
         logger.info(f"Exported analysis data to {output_file} for job_id: {job_id}")
         return output_file
+    
     except Exception as e:
         logger.error(f"Error exporting to Excel for job_id {job_id}: {str(e)}")
         raise
